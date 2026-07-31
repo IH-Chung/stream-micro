@@ -1,0 +1,32 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+
+# Pytest sandbox dirs (test artifacts)
+.pytest-*-sandbox/
+
+# Runtime config (contains secrets)
+bridge.yaml
+config.yaml
+
+# Sisyphus internal planning
+.sisyphus/
+
+# Build / output
+output/
+dist/
+build/
+
+# Frontend
+node_modules/
+.next/
+.wrangler/
+.openai/
+.vercel
+coverage/
+*.tsbuildinfo
+next-env.d.ts

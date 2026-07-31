@@ -1,0 +1,28 @@
+ollama:
+  settings_url: https://ollama.com/settings
+  cookie_name: __Secure-session
+  cookie_value: PASTE_COOKIE_VALUE_HERE
+  request_timeout_seconds: 15
+  refresh_interval_seconds: 60
+
+stream_deck:
+  device_serial: null
+  session_key_index: 0
+  weekly_key_index: 1
+  brightness: 40
+  reset_on_start: false
+  reset_on_exit: false
+
+display:
+  healthy_color: "#22c55e"
+  warning_color: "#f59e0b"
+  critical_color: "#ef4444"
+  error_color: "#dc2626"
+  background_color: "#0b1020"
+  text_color: "#ffffff"
+  warning_threshold: 70
+  critical_threshold: 90
+  reset_timezone: local
+
+logging:
+  level: INFO
