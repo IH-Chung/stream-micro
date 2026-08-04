@@ -41,6 +41,7 @@ type PluginSnapshot = {
 type BridgeStatus = {
   selected_session_id?: string | null;
   selected_session_ids?: Record<string, string>;
+  pinned_sessions?: Record<string, Session & { plugin: string }>;
   device: { connected: boolean; detail: string; key_count?: number };
 };
 
@@ -347,16 +348,27 @@ function App() {
     const parent = spanZones.get(keyIndex);
     if (!parent) return null;
     const sessions = sessionsForPlugin(parent.plugin);
-    // When span > 1, sessions are auto-assigned by slot — ignore session_id.
-    // session_id only applies to span=1 (single-key pinned to one session).
-    if (parent.span > 1) {
-      const slot = keyIndex - parent.key_index;
-      return sessions[slot] ?? null;
-    }
-    if (parent.session_id) {
+    const runtimePin = status?.pinned_sessions?.[String(keyIndex)];
+    if (runtimePin?.plugin === parent.plugin) return runtimePin;
+    if (parent.span === 1 && parent.session_id) {
       return sessions.find((s) => s.id === parent.session_id) ?? null;
     }
-    return sessions[0] ?? null;
+    const zoneIndices = Array.from(
+      { length: Math.max(parent.span, 1) },
+      (_, slot) => parent.key_index + slot,
+    );
+    const pinnedIds = new Set(
+      zoneIndices
+        .map((index) => status?.pinned_sessions?.[String(index)])
+        .filter((pin): pin is Session & { plugin: string } => pin?.plugin === parent.plugin)
+        .map((pin) => pin.id),
+    );
+    const available = sessions.filter((session) => !pinnedIds.has(session.id));
+    const unpinnedSlot = zoneIndices
+      .slice(0, keyIndex - parent.key_index)
+      .filter((index) => status?.pinned_sessions?.[String(index)]?.plugin !== parent.plugin)
+      .length;
+    return available[unpinnedSlot] ?? null;
   };
 
   const isZoneParent = (keyIndex: number) => {
@@ -675,12 +687,13 @@ function App() {
             const sublabel = session ? `${displayName(pluginId)} · ${session.project ?? "No project"}` : isChild ? `${displayName(pluginId)} · slot ${index - (parent?.key_index ?? 0) + 1}` : pluginId ? displayName(pluginId) : "Unassigned";
             const state = session?.state ?? (isQuota && quotaPercent != null ? `${quotaPercent}% used` : snapshot && !snapshot.health.connected ? snapshot.health.detail : button?.action ? displayName(button.action) : "No action");
             const stateColor = session ? sessionStateColor(session.state) : isQuota && typeof quotaPercent === "number" ? pctColor(quotaPercent) : undefined;
+            const isPinned = status?.pinned_sessions?.[String(index)]?.plugin === pluginId;
             return <button
               key={index}
               type="button"
               draggable
-              title={`Edit key ${index + 1}: ${label} — drag to rearrange`}
-              className={`deck-key ${session ? "session-key" : "utility-key"} provider-${pluginId ?? "none"} ${editingKey === index ? "is-editing" : ""} ${isParent && parent && parent.span > 1 ? "is-zone-parent" : ""} ${isChild ? "is-zone-child" : ""} ${dragSource === index ? "is-dragging" : ""} ${dragOver === index && dragSource !== null && dragSource !== index ? "is-drop-target" : ""}`}
+              title={`Edit key ${index + 1}: ${label}${isPinned ? " (pinned)" : ""} — drag to rearrange`}
+              className={`deck-key ${session ? "session-key" : "utility-key"} provider-${pluginId ?? "none"} ${editingKey === index ? "is-editing" : ""} ${isPinned ? "is-pinned" : ""} ${isParent && parent && parent.span > 1 ? "is-zone-parent" : ""} ${isChild ? "is-zone-child" : ""} ${dragSource === index ? "is-dragging" : ""} ${dragOver === index && dragSource !== null && dragSource !== index ? "is-drop-target" : ""}`}
               aria-pressed={editingKey === index}
               onClick={() => setEditingKey(index)}
               onDragStart={() => handleDragStart(index)}
@@ -691,7 +704,7 @@ function App() {
             ><span className="key-index">{index + 1}</span><strong>{label}</strong><small>{sublabel}</small><em style={stateColor ? { color: stateColor } : undefined}>{state}</em><span className="drag-handle" aria-hidden="true">⠿</span></button>;
           })}
         </div></div>
-        <div className="deck-legend"><span><i className="legend-dot editing-dot" /> Editing key</span><span><i className="legend-dot session-dot" /> Live Session display</span><span><i className="legend-dot" /> Other / unassigned</span></div>
+        <div className="deck-legend"><span><i className="legend-dot editing-dot" /> Editing key</span><span><i className="legend-dot pinned-dot" /> Pinned Session</span><span><i className="legend-dot session-dot" /> Live Session display</span><span><i className="legend-dot" /> Other / unassigned</span></div>
       </section>
 
       <aside className="detail-column">
@@ -734,6 +747,7 @@ function App() {
               <small>{selectedBinding.action === "select_session" ? "Physical press: resume this exact Session in a new console." : "Physical press: no Claude Code Session action configured."}</small>
             </> : selectedBinding?.plugin ? <><b>{displayName(selectedBinding.component)}</b><span>This key renders the selected Plugin component when that Plugin supplies it.</span><small>Physical action: {displayName(selectedBinding.action)}</small></> : <><b>Unassigned key</b><span>Choose a Plugin and Component to define what this key displays.</span><small>No physical action is configured.</small></>}
           </div>
+          {selectedBinding?.component === "session" && <p className="pin-hint">Short-press the physical key to open its Session. Hold it for 2 seconds to pin that Session to this slot; hold it again to unpin. An orange frame marks a pinned slot.</p>}
           {selectedBinding?.plugin && selectedBinding.component === "session" && isZoneParent(editingKey) && (selectedBinding.span ?? 1) === 1 && (() => {
             const assigned = selectedBinding.session_id ? selectedProviderSessions.find((session) => session.id === selectedBinding.session_id) : null;
             return <div className="session-picker">

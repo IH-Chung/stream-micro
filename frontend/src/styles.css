@@ -67,6 +67,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .deck-key.provider-opencode.is-zone-child { background: #142038; border-top-color: #8aa7ff; }
 .deck-key.is-zone-child strong { color: #8eaec0; }
 .deck-key.is-zone-child em { color: #5a9e8e; }
+.deck-key.is-pinned { border: 3px solid #f59e0b; box-shadow: 0 0 12px #f59e0b55; }
 
 /* Drag-and-drop visual feedback */
 .deck-key { touch-action: none; user-select: none; -webkit-user-drag: element; }
@@ -80,6 +81,7 @@ button:disabled { cursor: not-allowed; opacity: .45; }
 .legend-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #34445e; margin-right: 5px; }
 .editing-dot { background: #5ae7c3; }
 .session-dot { background: #5c9edb; }
+.pinned-dot { background: #f59e0b; }
 
 .detail-column { display: grid; gap: 22px; align-content: start; }
 .key-editor h2 { margin: 6px 0 8px; font-size: 24px; }
@@ -92,6 +94,7 @@ select:disabled { cursor: not-allowed; opacity: .6; }
 .binding-explainer b { color: #ecfff9; }
 .binding-explainer span { color: #b5d9cf; }
 .binding-explainer small { color: #80aea1; }
+.pin-hint { margin: 10px 0 0; color: #d9b76e; font-size: 11px; line-height: 1.5; }
 .device-card > div { display: grid; gap: 4px; margin: 8px 0; }
 .device-card h2 { margin: 0 0 14px; font-size: 22px; }
 .device-card b { color: #67e8c6; }

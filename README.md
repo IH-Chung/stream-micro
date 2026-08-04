@@ -39,7 +39,10 @@ so both surfaces use the same OpenCode Server.
 ## Session-key behavior
 
 - The first row contains five Session keys.
-- A Session key directly selects its matching OpenChamber Desktop Session.
+- Short-pressing a Session key selects its matching Session.
+- Holding a Session key for 2 seconds pins that Session to its current slot;
+  the key gets an orange frame and stays in place while the other Sessions
+  reorder. Hold the key again to unpin it.
 - When OpenChamber Desktop is running, Bridge auto-discovers its local control
   server and reads Sessions through its authenticated `/api` proxy. This keeps
   the Deck list and the OpenChamber UI on the same OpenCode Server.

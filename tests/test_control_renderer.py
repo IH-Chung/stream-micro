@@ -95,6 +95,18 @@ def test_codex_and_opencode_session_keys_have_distinct_provider_identity() -> No
     assert codex.tobytes() != opencode.tobytes()
 
 
+def test_pinned_session_key_has_orange_frame() -> None:
+    image = render_control_key(
+        ButtonBinding(key_index=0, plugin="opencode", component="session"),
+        AgentSession("session-1", "Pinned", SessionState.IDLE, "repo"),
+        selected=False,
+        pinned=True,
+        size=(96, 96),
+    )
+
+    assert image.getpixel((1, 48)) == (245, 158, 11)
+
+
 def test_quota_key_renders_generic_primary_and_secondary_windows() -> None:
     image = render_quota_key(
         ButtonBinding(key_index=5, plugin="codex", component="quota"),

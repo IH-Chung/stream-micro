@@ -79,6 +79,7 @@ def render_control_key(
     session: AgentSession | None,
     *,
     selected: bool,
+    pinned: bool = False,
     size: tuple[int, int],
     provider_id: str | None = None,
 ) -> Image.Image:
@@ -147,8 +148,15 @@ def render_control_key(
             fill="#8292aa",
             font=_font(8),
         )
+    if pinned:
+        draw.rectangle((0, 0, width - 1, height - 1), outline="#f59e0b", width=3)
     if selected:
-        draw.rectangle((0, 0, width - 1, height - 1), outline="#ffffff", width=2)
+        inset = 3 if pinned else 0
+        draw.rectangle(
+            (inset, inset, width - 1 - inset, height - 1 - inset),
+            outline="#ffffff",
+            width=2,
+        )
     return image
 
 

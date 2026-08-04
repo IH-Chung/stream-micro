@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,12 @@ class BridgeError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class PinnedSession:
+    plugin_id: str
+    session: AgentSession
+
+
 class BridgeService:
     """Owns loaded configuration, providers, and selected dashboard Session."""
 
@@ -53,6 +59,7 @@ class BridgeService:
         self.active_sessions_by_plugin: dict[str, tuple[AgentSession, ...]] = {}
         # Compatibility for callers that still populate the OpenCode list directly.
         self.active_sessions: tuple[AgentSession, ...] = ()
+        self.pinned_sessions: dict[int, PinnedSession] = {}
         self.device_status: dict[str, Any] = {
             "connected": False,
             "detail": "Waiting for Stream Deck",
@@ -120,6 +127,12 @@ class BridgeService:
         }
         if self.selected_session_id not in self.selected_session_ids.values():
             self.selected_session_id = None
+        self.pinned_sessions = {
+            key_index: pinned
+            for key_index, pinned in self.pinned_sessions.items()
+            if (parent := self._span_parent(key_index)) is not None
+            and parent.plugin == pinned.plugin_id
+        }
         return self.public_config_data()
 
     def manifests(self) -> list[dict[str, Any]]:
@@ -140,6 +153,17 @@ class BridgeService:
             plugin_id: snapshot.sessions for plugin_id, snapshot in snapshots.items()
         }
         self.active_sessions = self.active_sessions_by_plugin.get("opencode", ())
+        for key_index, pinned in tuple(self.pinned_sessions.items()):
+            fresh = next(
+                (
+                    session
+                    for session in self.active_sessions_by_plugin.get(pinned.plugin_id, ())
+                    if session.id == pinned.session.id
+                ),
+                None,
+            )
+            if fresh is not None:
+                self.pinned_sessions[key_index] = PinnedSession(pinned.plugin_id, fresh)
 
     def status_data(self, *, include_plugins: bool = True) -> dict[str, Any]:
         """Return Bridge state, optionally without expensive Plugin snapshots."""
@@ -147,6 +171,13 @@ class BridgeService:
         status: dict[str, Any] = {
             "selected_session_id": self.selected_session_id,
             "selected_session_ids": dict(self.selected_session_ids),
+            "pinned_sessions": {
+                str(key_index): {
+                    "plugin": pinned.plugin_id,
+                    **asdict(pinned.session),
+                }
+                for key_index, pinned in self.pinned_sessions.items()
+            },
             "pending_window_bindings": self.pending_window_bindings,
             "device": self.device_status,
             "openchamber": {
@@ -248,6 +279,34 @@ class BridgeService:
             return self.invoke(binding.plugin, binding.action, params)
         return {"result": "no_action"}
 
+    def toggle_session_pin(self, key_index: int) -> dict[str, Any]:
+        """Pin or unpin the Session currently displayed in one physical slot."""
+
+        if not isinstance(key_index, int) or not 0 <= key_index < len(self.config.buttons):
+            raise BridgeError("key_index must be an MK.2 key from 0 through 14")
+        pinned = self.pinned_sessions.pop(key_index, None)
+        if pinned is not None:
+            return {
+                "result": "session_unpinned",
+                "key_index": key_index,
+                "session_id": pinned.session.id,
+            }
+        parent = self._span_parent(key_index)
+        if parent is None or not parent.plugin:
+            raise BridgeError("Only a key displaying a Session can be pinned")
+        session = self.session_for_key(key_index)
+        if session is None:
+            raise BridgeError("This key has no Session to pin")
+        self.pinned_sessions[key_index] = PinnedSession(parent.plugin, session)
+        return {
+            "result": "session_pinned",
+            "key_index": key_index,
+            "session_id": session.id,
+        }
+
+    def is_key_pinned(self, key_index: int) -> bool:
+        return key_index in self.pinned_sessions
+
     def _span_parent(self, key_index: int) -> ButtonBinding | None:
         """Return the span zone root that owns ``key_index``, or None.
 
@@ -268,29 +327,48 @@ class BridgeService:
     ) -> dict[str, Any]:
         if not parent.plugin or not parent.action:
             return {"result": "no_action"}
-        sessions = self._sessions_for_plugin(parent.plugin)
-        slot = key_index - parent.key_index
-        # span > 1: sessions auto-assigned by slot, ignore session_id.
-        # span = 1: session_id pins to one session; fallback to slot 0.
-        if parent.span > 1:
-            if slot < len(sessions):
-                session = sessions[slot]
-                params = {**parent.action_params, "session_id": session.id}
-                return self.invoke(parent.plugin, parent.action, params)
-            return {"result": "no_action"}
-        if parent.session_id:
-            session = next(
-                (s for s in sessions if s.id == parent.session_id),
-                None,
-            )
-            if session is None:
-                raise BridgeError(f"Session {parent.session_id} is no longer active")
+        session = self.session_for_key(key_index)
+        if session is not None:
             params = {**parent.action_params, "session_id": session.id}
             return self.invoke(parent.plugin, parent.action, params)
-        if sessions:
-            params = {**parent.action_params, "session_id": sessions[0].id}
-            return self.invoke(parent.plugin, parent.action, params)
         return {"result": "no_action"}
+
+    def session_for_key(self, key_index: int) -> AgentSession | None:
+        """Resolve a Session slot while keeping pinned slots stable and unique."""
+
+        parent = self._span_parent(key_index)
+        if parent is None or not parent.plugin:
+            return None
+        if parent.span == 1 and parent.session_id and key_index not in self.pinned_sessions:
+            return next(
+                (
+                    session
+                    for session in self._sessions_for_plugin(parent.plugin)
+                    if session.id == parent.session_id
+                ),
+                None,
+            )
+
+        zone_indices = range(parent.key_index, parent.key_index + max(parent.span, 1))
+        pinned_by_key = {
+            index: pinned.session
+            for index in zone_indices
+            if (pinned := self.pinned_sessions.get(index)) is not None
+            and pinned.plugin_id == parent.plugin
+        }
+        pinned_ids = {session.id for session in pinned_by_key.values()}
+        available = iter(
+            session
+            for session in self._sessions_for_plugin(parent.plugin)
+            if session.id not in pinned_ids
+        )
+        for index in zone_indices:
+            session = pinned_by_key.get(index)
+            if session is None:
+                session = next(available, None)
+            if index == key_index:
+                return session
+        return None
 
     def _sessions_for_plugin(self, plugin_id: str) -> tuple[AgentSession, ...]:
         sessions = self.active_sessions_by_plugin.get(plugin_id)

@@ -136,6 +136,89 @@ def test_span_child_key_selects_its_session_slot(tmp_path: Path) -> None:
     assert service.calls == [("opencode", "select_session", {"session_id": "session-4"})]
 
 
+def test_long_press_pins_session_to_slot_while_other_slots_reorder(tmp_path: Path) -> None:
+    path = tmp_path / "bridge.yaml"
+    write_control_config(path, default_control_config())
+    service = RecordingService(path)
+    first = tuple(
+        AgentSession(f"session-{index}", f"Test {index}", SessionState.IDLE)
+        for index in range(1, 5)
+    )
+    service.active_sessions = first
+
+    assert service.toggle_session_pin(1) == {
+        "result": "session_pinned",
+        "key_index": 1,
+        "session_id": "session-2",
+    }
+
+    service.active_sessions = (
+        AgentSession("session-4", "Test 4", SessionState.RUNNING),
+        AgentSession("session-3", "Test 3", SessionState.IDLE),
+        AgentSession("session-2", "Test 2 updated", SessionState.WAITING),
+        AgentSession("session-1", "Test 1", SessionState.IDLE),
+    )
+    service.set_active_snapshots(
+        {
+            "opencode": PluginSnapshot(
+                PluginHealth(True, "Connected"), service.active_sessions
+            )
+        }
+    )
+
+    resolved = [service.session_for_key(index) for index in range(4)]
+    assert all(session is not None for session in resolved)
+    assert [session.id for session in resolved if session is not None] == [
+        "session-4",
+        "session-2",
+        "session-3",
+        "session-1",
+    ]
+    pinned_session = service.session_for_key(1)
+    assert pinned_session is not None
+    assert pinned_session.title == "Test 2 updated"
+    assert service.status_data(include_plugins=False)["pinned_sessions"]["1"]["id"] == (
+        "session-2"
+    )
+
+    assert service.toggle_session_pin(1)["result"] == "session_unpinned"
+    unpinned_session = service.session_for_key(1)
+    assert unpinned_session is not None
+    assert unpinned_session.id == "session-3"
+
+
+def test_physical_release_dispatches_short_press_or_long_press_pin(tmp_path: Path) -> None:
+    path = tmp_path / "bridge.yaml"
+    write_control_config(path, default_control_config())
+    service = RecordingService(path)
+    service.active_sessions = (
+        AgentSession("session-1", "First", SessionState.IDLE),
+        AgentSession("session-2", "Second", SessionState.IDLE),
+    )
+    now = [10.0]
+    runner = Mk2BridgeRunner(service, clock=lambda: now[0])
+
+    runner._on_key(0, True)
+    now[0] = 10.2
+    runner._on_key(0, False)
+
+    assert service.calls == [("opencode", "select_session", {"session_id": "session-1"})]
+    assert not service.is_key_pinned(0)
+
+    runner._on_key(1, True)
+    now[0] = 12.3
+    runner._on_key(1, False)
+
+    assert len(service.calls) == 1
+    assert service.is_key_pinned(1)
+
+    runner._on_key(1, True)
+    now[0] = 14.4
+    runner._on_key(1, False)
+
+    assert not service.is_key_pinned(1)
+
+
 def test_standalone_session_key_on_key_6(tmp_path: Path) -> None:
     """A span=1 session key placed on key 6 selects the first available Session."""
 

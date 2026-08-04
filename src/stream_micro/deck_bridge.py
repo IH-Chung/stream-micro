@@ -16,11 +16,17 @@ from .plugins.opencode import OpenCodeError
 
 
 class Mk2BridgeRunner:
-    def __init__(self, service: BridgeService) -> None:
+    LONG_PRESS_SECONDS = 2.0
+
+    def __init__(
+        self, service: BridgeService, *, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         self.service = service
         self.sessions: tuple[AgentSession, ...] = ()
         self.sessions_by_plugin: dict[str, tuple[AgentSession, ...]] = {}
         self._refresh_requested = Event()
+        self._pressed_at: dict[int, float] = {}
+        self._clock = clock
         self._logger = logging.getLogger(__name__)
 
     def refresh(self, output: Mk2DeckOutput) -> None:
@@ -46,20 +52,7 @@ class Mk2BridgeRunner:
             session = None
             parent = span_parents.get(binding.key_index)
             if parent is not None:
-                provider_sessions = self.sessions_by_plugin.get(parent.plugin or "", ())
-                # span > 1: sessions auto-assigned by slot, ignore session_id.
-                # span = 1: session_id pins to one session; fallback to slot 0.
-                if parent.span > 1:
-                    slot = binding.key_index - parent.key_index
-                    if slot < len(provider_sessions):
-                        session = provider_sessions[slot]
-                elif parent.session_id:
-                    session = next(
-                        (s for s in provider_sessions if s.id == parent.session_id),
-                        None,
-                    )
-                elif provider_sessions:
-                    session = provider_sessions[0]
+                session = self.service.session_for_key(binding.key_index)
             if binding.component == "quota":
                 image = render_quota_key(
                     binding,
@@ -75,6 +68,7 @@ class Mk2BridgeRunner:
                         and parent is not None
                         and session.id == self.service.selected_session_ids.get(parent.plugin or "")
                     ),
+                    pinned=self.service.is_key_pinned(binding.key_index),
                     size=output.key_size,
                     provider_id=parent.plugin if parent is not None else binding.plugin,
                 )
@@ -110,10 +104,17 @@ class Mk2BridgeRunner:
                 sleep(self.service.config.bridge.refresh_interval_seconds)
 
     def _on_key(self, key_index: int, pressed: bool) -> None:
-        if not pressed:
+        if pressed:
+            self._pressed_at.setdefault(key_index, self._clock())
+            return
+        started_at = self._pressed_at.pop(key_index, None)
+        if started_at is None:
             return
         try:
-            self.press(key_index)
+            if self._clock() - started_at >= self.LONG_PRESS_SECONDS:
+                self.service.toggle_session_pin(key_index)
+            else:
+                self.press(key_index)
         except (BridgeError, OpenCodeError) as exc:
             logging.getLogger(__name__).error("Key %s action failed: %s", key_index, exc)
         except Exception:
