@@ -9,7 +9,7 @@ from threading import Event
 
 from .bridge import BridgeError, BridgeService
 from .control_config import ButtonBinding
-from .control_renderer import render_control_key
+from .control_renderer import render_control_key, render_quota_key
 from .device import DeviceError, Mk2DeckOutput
 from .plugins.base import AgentSession
 from .plugins.opencode import OpenCodeError
@@ -19,12 +19,23 @@ class Mk2BridgeRunner:
     def __init__(self, service: BridgeService) -> None:
         self.service = service
         self.sessions: tuple[AgentSession, ...] = ()
+        self.sessions_by_plugin: dict[str, tuple[AgentSession, ...]] = {}
         self._refresh_requested = Event()
+        self._logger = logging.getLogger(__name__)
 
     def refresh(self, output: Mk2DeckOutput) -> None:
-        snapshot = self.service.snapshots().get("opencode")
-        self.sessions = snapshot.sessions if snapshot else ()
-        self.service.active_sessions = self.sessions
+        # Push the configured brightness on every refresh.  __enter__ only
+        # sets it once at connect time, so without this the dashboard slider
+        # has no effect until the Deck reconnects.
+        configured = self.service.config.stream_deck.brightness
+        self._logger.debug("refresh: pushing brightness=%d to device", configured)
+        output.set_brightness(configured)
+        snapshots = self.service.snapshots()
+        self.sessions_by_plugin = {
+            plugin_id: snapshot.sessions for plugin_id, snapshot in snapshots.items()
+        }
+        self.sessions = self.sessions_by_plugin.get("opencode", ())
+        self.service.set_active_snapshots(snapshots)
         # Build span zone lookup: key_index -> parent ButtonBinding
         span_parents: dict[int, ButtonBinding] = {}
         for b in self.service.config.buttons:
@@ -35,25 +46,38 @@ class Mk2BridgeRunner:
             session = None
             parent = span_parents.get(binding.key_index)
             if parent is not None:
+                provider_sessions = self.sessions_by_plugin.get(parent.plugin or "", ())
                 # span > 1: sessions auto-assigned by slot, ignore session_id.
                 # span = 1: session_id pins to one session; fallback to slot 0.
                 if parent.span > 1:
                     slot = binding.key_index - parent.key_index
-                    if slot < len(self.sessions):
-                        session = self.sessions[slot]
+                    if slot < len(provider_sessions):
+                        session = provider_sessions[slot]
                 elif parent.session_id:
                     session = next(
-                        (s for s in self.sessions if s.id == parent.session_id),
+                        (s for s in provider_sessions if s.id == parent.session_id),
                         None,
                     )
-                elif self.sessions:
-                    session = self.sessions[0]
-            image = render_control_key(
-                binding,
-                session,
-                selected=session is not None and session.id == self.service.selected_session_id,
-                size=output.key_size,
-            )
+                elif provider_sessions:
+                    session = provider_sessions[0]
+            if binding.component == "quota":
+                image = render_quota_key(
+                    binding,
+                    snapshots.get(binding.plugin or ""),
+                    size=output.key_size,
+                )
+            else:
+                image = render_control_key(
+                    binding,
+                    session,
+                    selected=(
+                        session is not None
+                        and parent is not None
+                        and session.id == self.service.selected_session_ids.get(parent.plugin or "")
+                    ),
+                    size=output.key_size,
+                    provider_id=parent.plugin if parent is not None else binding.plugin,
+                )
             output.set_key(binding.key_index, image)
 
     def press(self, key_index: int) -> None:

@@ -1,0 +1,429 @@
+"""Claude Code sessions backed by local history and lifecycle hooks."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+from collections import deque
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from .base import AgentSession, PluginHealth, PluginManifest, PluginSnapshot, SessionState
+
+MAX_VISIBLE_SESSIONS = 15
+MAX_HISTORY_LINES = 5000
+_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]+$")
+_ALLOWED_KEYS = frozenset(
+    {"enabled", "claude_path", "claude_home", "plugin_dir", "max_sessions"}
+)
+
+
+class ClaudeCodeError(RuntimeError):
+    """Raised when the Claude Code integration cannot complete an operation."""
+
+
+@dataclass(frozen=True)
+class ClaudeHistorySession:
+    id: str
+    title: str
+    directory: str | None
+    updated_at: float
+
+
+@dataclass
+class _LiveSession:
+    id: str
+    title: str
+    directory: str | None
+    state: SessionState
+    updated_at: float
+
+
+def validate_claude_code_config(config: dict[str, object]) -> None:
+    unknown = sorted(set(config) - _ALLOWED_KEYS)
+    if unknown:
+        raise ClaudeCodeError(f"Unknown claude_code setting(s): {', '.join(unknown)}")
+    enabled = config.get("enabled")
+    if "enabled" in config and not isinstance(enabled, bool):
+        raise ClaudeCodeError("claude_code.enabled must be a boolean")
+    for name in ("claude_path", "claude_home", "plugin_dir"):
+        value = config.get(name)
+        if value is not None and (not isinstance(value, str) or not value.strip()):
+            raise ClaudeCodeError(f"claude_code.{name} must be a non-empty string or null")
+    maximum = config.get("max_sessions", MAX_VISIBLE_SESSIONS)
+    if (
+        not isinstance(maximum, int)
+        or isinstance(maximum, bool)
+        or not 1 <= maximum <= MAX_VISIBLE_SESSIONS
+    ):
+        raise ClaudeCodeError(
+            f"claude_code.max_sessions must be an integer from 1 to {MAX_VISIBLE_SESSIONS}"
+        )
+
+
+def _clean_title(value: object) -> str:
+    if not isinstance(value, str):
+        return "Claude Code session"
+    normalized = " ".join(value.split())
+    if not normalized:
+        return "Claude Code session"
+    return normalized[:80]
+
+
+def _project_name(directory: str | None) -> str | None:
+    if not directory:
+        return None
+    name = Path(directory).name
+    return name or directory
+
+
+def read_claude_history(
+    history_path: Path, *, max_sessions: int = MAX_VISIBLE_SESSIONS
+) -> tuple[ClaudeHistorySession, ...]:
+    """Read the most recent unique sessions from Claude Code's local history."""
+
+    try:
+        with history_path.open(encoding="utf-8") as stream:
+            lines = deque(stream, maxlen=MAX_HISTORY_LINES)
+    except OSError:
+        return ()
+
+    sessions: dict[str, ClaudeHistorySession] = {}
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(item, Mapping):
+            continue
+        session_id = item.get("sessionId")
+        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+            continue
+        timestamp = item.get("timestamp", 0)
+        updated_at = float(timestamp) if isinstance(timestamp, (int, float)) else 0.0
+        directory = item.get("project")
+        if not isinstance(directory, str) or not directory.strip():
+            directory = None
+        candidate = ClaudeHistorySession(
+            session_id,
+            _clean_title(item.get("display")),
+            directory,
+            updated_at,
+        )
+        current = sessions.get(session_id)
+        if current is None or candidate.updated_at >= current.updated_at:
+            sessions[session_id] = candidate
+    return tuple(
+        sorted(sessions.values(), key=lambda session: session.updated_at, reverse=True)[
+            :max_sessions
+        ]
+    )
+
+
+def map_claude_hook_state(payload: Mapping[str, object]) -> SessionState | None:
+    """Map documented Claude Code lifecycle hook events to Deck states."""
+
+    event = payload.get("hook_event_name")
+    if event == "SessionStart":
+        return SessionState.RUNNING if payload.get("source") == "compact" else SessionState.IDLE
+    if event in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+        return SessionState.RUNNING
+    if event == "PermissionRequest":
+        return SessionState.WAITING
+    if event == "Notification":
+        notification = payload.get("notification_type")
+        if notification in ("permission_prompt", "agent_needs_input", "elicitation_dialog"):
+            return SessionState.WAITING
+        if notification in ("idle_prompt", "agent_completed"):
+            return SessionState.COMPLETED
+        return None
+    if event == "Stop":
+        return SessionState.COMPLETED
+    if event == "StopFailure":
+        return SessionState.ERROR
+    if event == "SessionEnd":
+        return SessionState.IDLE
+    return None
+
+
+def parse_claude_rate_limits(
+    payload: Mapping[str, object],
+) -> dict[str, str | float | int | None]:
+    """Translate documented Claude Code status-line limits into quota signals."""
+
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, Mapping):
+        return {}
+
+    signals: dict[str, str | float | int | None] = {}
+    for source, prefix, label in (
+        ("five_hour", "primary", "5H"),
+        ("seven_day", "secondary", "7D"),
+    ):
+        window = rate_limits.get(source)
+        if not isinstance(window, Mapping):
+            continue
+        used = window.get("used_percentage")
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and 0 <= used <= 100:
+            signals[f"{prefix}_percent"] = float(used)
+            signals[f"{prefix}_label"] = label
+        resets_at = window.get("resets_at")
+        if (
+            isinstance(resets_at, (int, float))
+            and not isinstance(resets_at, bool)
+            and resets_at > 0
+        ):
+            try:
+                reset = datetime.fromtimestamp(resets_at, tz=timezone.utc).isoformat()
+            except (OverflowError, OSError, ValueError):
+                continue
+            signals[f"{prefix}_reset_at"] = reset
+    return signals
+
+
+def resolve_claude_command(claude_path: str) -> list[str]:
+    """Resolve a Claude Code executable or Windows command shim safely."""
+
+    requested = Path(claude_path).expanduser()
+    resolved = shutil.which(str(requested))
+    if resolved is None and not requested.suffix:
+        resolved = shutil.which(f"{claude_path}.cmd") or shutil.which(f"{claude_path}.exe")
+    resolved = resolved or (str(requested) if requested.exists() else claude_path)
+    suffix = Path(resolved).suffix.lower()
+    if suffix in (".cmd", ".bat"):
+        return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", resolved]
+    if suffix == ".ps1":
+        return [
+            "powershell.exe",
+            "-NoLogo",
+            "-NoProfile",
+            "-File",
+            resolved,
+        ]
+    return [resolved]
+
+
+def launch_claude_session(
+    session_id: str,
+    directory: str | None,
+    *,
+    claude_path: str = "claude",
+    plugin_dir: str | None = None,
+) -> None:
+    """Resume a Claude Code session in a new Windows console."""
+
+    if os.name != "nt":
+        raise ClaudeCodeError("Claude Code Session resume is currently available only on Windows")
+    if not _SESSION_ID.fullmatch(session_id):
+        raise ClaudeCodeError("Invalid Claude Code Session ID")
+    working_directory = directory if directory and Path(directory).is_dir() else None
+    plugin_args = ["--plugin-dir", str(Path(plugin_dir).expanduser())] if plugin_dir else []
+    try:
+        subprocess.Popen(
+            [*resolve_claude_command(claude_path), *plugin_args, "--resume", session_id],
+            cwd=working_directory,
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+            shell=False,
+        )
+    except OSError as exc:
+        raise ClaudeCodeError(f"Could not open Claude Code Session: {exc}") from exc
+
+
+class ClaudeCodePlugin:
+    """Expose Claude Code Sessions to Stream Deck session zones."""
+
+    manifest = PluginManifest(
+        id="claude_code",
+        name="Claude Code",
+        components=("session", "quota"),
+        actions=("select_session",),
+    )
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        launcher: Callable[[str, str | None], None] | None = None,
+        clock: Callable[[], float] = time.time,
+    ) -> None:
+        self.validate_config(config)
+        self.config = dict(config)
+        self._clock = clock
+        claude_path = self.config.get("claude_path") or "claude"
+        plugin_dir = self.config.get("plugin_dir")
+        self._launcher = launcher or (
+            lambda session_id, directory: launch_claude_session(
+                session_id,
+                directory,
+                claude_path=claude_path,
+                plugin_dir=plugin_dir if isinstance(plugin_dir, str) else None,
+            )
+        )
+        configured_home = self.config.get("claude_home")
+        self.home = (
+            Path(configured_home).expanduser()
+            if isinstance(configured_home, str)
+            else Path.home() / ".claude"
+        )
+        self.history_path = self.home / "history.jsonl"
+        self.max_sessions = int(self.config.get("max_sessions", MAX_VISIBLE_SESSIONS))
+        self._lock = threading.Lock()
+        self._live: dict[str, _LiveSession] = {}
+        self._history_key: tuple[int, int] | None = None
+        self._history: tuple[ClaudeHistorySession, ...] = ()
+        self._last_hook_at: float | None = None
+        self._quota_signals: dict[str, str | float | int | None] = {}
+
+    def validate_config(self, config: dict[str, Any]) -> None:
+        if not isinstance(config, dict):
+            raise ClaudeCodeError("claude_code config must be a mapping")
+        validate_claude_code_config(config)
+
+    def handle_hook(self, payload: dict[str, Any]) -> dict[str, str | bool | None]:
+        session_id = payload.get("session_id")
+        event = payload.get("hook_event_name")
+        if (
+            not isinstance(session_id, str)
+            or not _SESSION_ID.fullmatch(session_id)
+            or not isinstance(event, str)
+        ):
+            raise ClaudeCodeError("Claude Code hook requires session_id and hook_event_name")
+        state = map_claude_hook_state(payload)
+        now = self._clock() * 1000
+        directory = payload.get("cwd")
+        if not isinstance(directory, str) or not directory.strip():
+            directory = None
+        title_value = payload.get("session_title")
+        if not isinstance(title_value, str) or not title_value.strip():
+            title_value = payload.get("prompt")
+        with self._lock:
+            current = self._live.get(session_id)
+            title = (
+                _clean_title(title_value)
+                if isinstance(title_value, str) and title_value.strip()
+                else current.title
+                if current is not None
+                else "Claude Code session"
+            )
+            self._live[session_id] = _LiveSession(
+                session_id,
+                title,
+                directory or (current.directory if current else None),
+                state or (current.state if current else SessionState.IDLE),
+                now,
+            )
+            self._last_hook_at = now
+        return {
+            "accepted": True,
+            "session_id": session_id,
+            "state": state.value if state is not None else None,
+        }
+
+    def handle_quota(self, payload: dict[str, Any]) -> dict[str, str | bool | None]:
+        """Accept the account limits exposed to Claude Code status-line commands."""
+
+        session_id = payload.get("session_id")
+        if session_id is not None and (
+            not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id)
+        ):
+            raise ClaudeCodeError("Claude Code quota update has an invalid session_id")
+        signals = parse_claude_rate_limits(payload)
+        if signals:
+            with self._lock:
+                self._quota_signals = signals
+        return {
+            "accepted": True,
+            "session_id": session_id if isinstance(session_id, str) else None,
+            "quota_updated": bool(signals),
+        }
+
+    def _history_sessions(self) -> tuple[ClaudeHistorySession, ...]:
+        try:
+            stat = self.history_path.stat()
+            key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            key = None
+        with self._lock:
+            if key == self._history_key:
+                return self._history
+        history = read_claude_history(self.history_path, max_sessions=self.max_sessions)
+        with self._lock:
+            self._history_key = key
+            self._history = history
+        return history
+
+    def snapshot(self) -> PluginSnapshot:
+        history = self._history_sessions()
+        with self._lock:
+            live = {session_id: record for session_id, record in self._live.items()}
+            last_hook_at = self._last_hook_at
+            quota_signals = dict(self._quota_signals)
+
+        merged: dict[str, _LiveSession] = {
+            item.id: _LiveSession(
+                item.id,
+                item.title,
+                item.directory,
+                SessionState.IDLE,
+                item.updated_at,
+            )
+            for item in history
+        }
+        for session_id, record in live.items():
+            previous = merged.get(session_id)
+            merged[session_id] = _LiveSession(
+                session_id,
+                record.title
+                if record.title != "Claude Code session" or previous is None
+                else previous.title,
+                record.directory or (previous.directory if previous else None),
+                record.state,
+                max(record.updated_at, previous.updated_at if previous else 0),
+            )
+        recent = sorted(merged.values(), key=lambda item: item.updated_at, reverse=True)[
+            : self.max_sessions
+        ]
+        sessions = tuple(
+            AgentSession(
+                item.id,
+                item.title,
+                item.state,
+                _project_name(item.directory),
+                item.directory,
+            )
+            for item in recent
+        )
+        executable = self.config.get("claude_path") or "claude"
+        command_available = bool(shutil.which(str(executable))) or Path(str(executable)).exists()
+        connected = command_available or bool(history) or bool(live)
+        if last_hook_at is not None:
+            detail = f"Live hooks connected; {len(sessions)} recent Sessions"
+        elif connected:
+            detail = f"{len(sessions)} recent Sessions; waiting for live hooks"
+        else:
+            detail = "Claude Code was not found"
+        return PluginSnapshot(
+            PluginHealth(connected, detail, str(self.history_path)),
+            sessions,
+            quota_signals or None,
+        )
+
+    def invoke(self, action: str, params: dict[str, Any]) -> Any:
+        if action != "select_session":
+            raise ClaudeCodeError(f"Unsupported Claude Code action: {action}")
+        session_id = params.get("session_id")
+        if not isinstance(session_id, str) or not _SESSION_ID.fullmatch(session_id):
+            raise ClaudeCodeError("select_session requires a valid session_id")
+        session = next((item for item in self.snapshot().sessions if item.id == session_id), None)
+        if session is None:
+            raise ClaudeCodeError("Claude Code Session no longer exists")
+        self._launcher(session.id, session.directory)
+        return {"result": "session_selected_in_claude_code", "session_id": session.id}

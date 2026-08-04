@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import cast
 
 from stream_micro.bridge import BridgeService
 from stream_micro.control_config import (
@@ -8,7 +9,36 @@ from stream_micro.control_config import (
     write_control_config,
 )
 from stream_micro.deck_bridge import Mk2BridgeRunner
-from stream_micro.plugins.base import AgentSession, SessionState
+from stream_micro.device import Mk2DeckOutput
+from stream_micro.plugins.base import (
+    AgentSession,
+    BridgePlugin,
+    PluginHealth,
+    PluginSnapshot,
+    SessionState,
+)
+
+
+class SnapshotPlugin:
+    def __init__(self, snapshot: PluginSnapshot) -> None:
+        self._snapshot = snapshot
+
+    def snapshot(self) -> PluginSnapshot:
+        return self._snapshot
+
+
+class RecordingOutput:
+    key_size = (96, 96)
+
+    def __init__(self) -> None:
+        self.brightness: list[int] = []
+        self.images = {}
+
+    def set_brightness(self, brightness: int) -> None:
+        self.brightness.append(brightness)
+
+    def set_key(self, key_index: int, image) -> None:
+        self.images[key_index] = image
 
 
 class RecordingService(BridgeService):
@@ -18,10 +48,25 @@ class RecordingService(BridgeService):
         self.captured: list[str] = []
         self.focused: list[str] = []
         self.gui_selected: list[AgentSession] = []
+        self.codex_selected: list[str] = []
 
     def invoke(self, plugin_id: str, action: str, params: dict[str, str]):
         self.calls.append((plugin_id, action, params))
-        return {}
+        if action == "select_session":
+            session_id = params["session_id"]
+            if plugin_id == "opencode":
+                session = next(
+                    item for item in self._sessions_for_plugin(plugin_id) if item.id == session_id
+                )
+                self._select_openchamber_session(session)
+                return {
+                    "result": "session_selected_in_openchamber",
+                    "session_id": session_id,
+                }
+            if plugin_id == "codex":
+                self.codex_selected.append(session_id)
+                return {"result": "session_selected_in_codex", "session_id": session_id}
+        return {"result": "invoked"}
 
     def capture_session_window(self, session_id: str):
         self.captured.append(session_id)
@@ -67,7 +112,7 @@ def test_session_key_selects_the_matching_openchamber_session(tmp_path: Path) ->
 
     assert result == {"result": "session_selected_in_openchamber", "session_id": "session-1"}
     assert [session.id for session in service.gui_selected] == ["session-1"]
-    assert service.calls == []
+    assert service.calls == [("opencode", "select_session", {"session_id": "session-1"})]
     assert service.captured == []
 
 
@@ -88,7 +133,7 @@ def test_span_child_key_selects_its_session_slot(tmp_path: Path) -> None:
 
     assert result == {"result": "session_selected_in_openchamber", "session_id": "session-4"}
     assert [session.id for session in service.gui_selected] == ["session-4"]
-    assert service.calls == []
+    assert service.calls == [("opencode", "select_session", {"session_id": "session-4"})]
 
 
 def test_standalone_session_key_on_key_6(tmp_path: Path) -> None:
@@ -110,3 +155,84 @@ def test_standalone_session_key_on_key_6(tmp_path: Path) -> None:
 
     assert result == {"result": "session_selected_in_openchamber", "session_id": "session-1"}
     assert [session.id for session in service.gui_selected] == ["session-1"]
+
+
+def test_codex_quota_component_renders_from_the_codex_snapshot(tmp_path: Path) -> None:
+    path = tmp_path / "bridge.yaml"
+    data = control_config_data(default_control_config())
+    data["buttons"][5].update({"plugin": "codex", "component": "quota"})
+    write_control_config(path, parse_control_config(data))
+    service = RecordingService(path)
+    service.plugins["codex"] = cast(
+        BridgePlugin,
+        SnapshotPlugin(
+            PluginSnapshot(
+                PluginHealth(True, "Connected"),
+                signals={"primary_percent": 25.0, "primary_label": "5H"},
+            )
+        ),
+    )
+    output = RecordingOutput()
+
+    Mk2BridgeRunner(service).refresh(cast(Mk2DeckOutput, output))
+
+    assert output.brightness == [40]
+    assert output.images[5].getpixel((6, 50)) == (34, 197, 94)
+
+
+def test_codex_session_zone_uses_codex_sessions_and_codex_deep_link_action(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bridge.yaml"
+    data = control_config_data(default_control_config())
+    data["plugins"]["codex"]["enabled"] = True
+    data["buttons"][5].update(
+        {
+            "plugin": "codex",
+            "component": "session",
+            "span": 2,
+            "action": "select_session",
+        }
+    )
+    write_control_config(path, parse_control_config(data))
+    service = RecordingService(path)
+    service.plugins = {
+        "opencode": cast(
+            BridgePlugin,
+            SnapshotPlugin(
+                PluginSnapshot(
+                    PluginHealth(True, "Connected"),
+                    sessions=(AgentSession("open-1", "OpenCode chat", SessionState.IDLE),),
+                )
+            ),
+        ),
+        "codex": cast(
+            BridgePlugin,
+            SnapshotPlugin(
+                PluginSnapshot(
+                    PluginHealth(True, "Connected"),
+                    sessions=(
+                        AgentSession("codex-1", "Codex chat", SessionState.RUNNING),
+                        AgentSession("codex-2", "Second Codex chat", SessionState.WAITING),
+                    ),
+                )
+            ),
+        ),
+    }
+    output = RecordingOutput()
+    runner = Mk2BridgeRunner(service)
+
+    runner.refresh(cast(Mk2DeckOutput, output))
+    result = service.press_key(6)
+
+    assert service.active_sessions_by_plugin["opencode"][0].id == "open-1"
+    assert [session.id for session in service.active_sessions_by_plugin["codex"]] == [
+        "codex-1",
+        "codex-2",
+    ]
+    assert output.images[0].getpixel((10, 1)) == (138, 167, 255)
+    assert output.images[5].getpixel((10, 1)) == (72, 224, 180)
+    assert output.images[6].getpixel((10, 1)) == (72, 224, 180)
+    assert result == {"result": "session_selected_in_codex", "session_id": "codex-2"}
+    assert service.codex_selected == ["codex-2"]
+    assert service.gui_selected == []

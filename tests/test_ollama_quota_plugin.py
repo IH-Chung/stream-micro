@@ -20,7 +20,9 @@ def test_unknown_config_key_is_rejected() -> None:
 
 
 def test_legacy_keys_are_ignored() -> None:
-    plugin = OllamaQuotaPlugin({"enabled": True, "legacy_config_path": "config.yaml", "cookie_value": ""})
+    plugin = OllamaQuotaPlugin(
+        {"enabled": True, "legacy_config_path": "config.yaml", "cookie_value": ""}
+    )
     snapshot = plugin.snapshot()
     assert snapshot.health.connected is False
     assert "cookie" in snapshot.health.detail.lower()

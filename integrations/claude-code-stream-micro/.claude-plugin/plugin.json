@@ -1,0 +1,10 @@
+{
+  "name": "stream-micro",
+  "version": "0.1.0",
+  "description": "Reports Claude Code Session lifecycle state to the local Stream Micro Bridge.",
+  "author": {
+    "name": "stream-micro"
+  },
+  "license": "MIT",
+  "keywords": ["stream-deck", "session-status", "local-bridge"]
+}

@@ -19,5 +19,23 @@ def test_dashboard_refresh_is_lightweight_and_never_dispatches_actions() -> None
 
     assert "refreshInFlightRef" in source
     assert 'status?include_plugins=false' in source
+    assert 'plugins/snapshots' in source
+    assert "sessionsForPlugin(parent.plugin)" in source
+    assert 'api<Session[]>("opencode/sessions")' not in source
     assert "Test action" not in source
     assert 'api("actions"' not in source
+
+
+def test_provider_and_quota_settings_have_a_dedicated_configuration_tab() -> None:
+    source = FRONTEND.read_text(encoding="utf-8")
+
+    assert 'useState<"buttons" | "configuration">("buttons")' in source
+    assert 'role="tablist"' in source
+    assert "Hardware, providers and quota" in source
+    assert 'activeTab === "buttons" ?' in source
+    assert '<OpenCodeCard config={config}' in source
+    assert '<CodexCard config={config}' in source
+    assert '<ClaudeCodeCard config={config}' in source
+    assert '<OllamaQuotaCard config={config}' in source
+    assert "Enable Ollama Cloud quota provider" in source
+    assert 'aria-label="Bridge configuration"' in source

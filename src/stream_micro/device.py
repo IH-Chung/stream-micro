@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -92,6 +93,7 @@ class StreamDeckOutput:
             ) from close_error
 
     def __enter__(self) -> StreamDeckOutput:
+        logger = logging.getLogger(__name__)
         manager_factory, pil_helper = self._load_dependencies()
         try:
             decks = [deck for deck in manager_factory().enumerate() if deck.is_visual()]
@@ -119,6 +121,7 @@ class StreamDeckOutput:
                 )
             if self.config.reset_on_start:
                 deck.reset()
+            logger.debug("__enter__: setting initial brightness=%d", self.config.brightness)
             deck.set_brightness(self.config.brightness)
         except BaseException as exc:
             if selected is not None:
@@ -190,6 +193,19 @@ class StreamDeckOutput:
                 self.deck.set_key_image(index, native)
         except Exception as exc:
             raise DeviceError(f"Failed to update Stream Deck key {index}: {exc}") from exc
+
+    def set_brightness(self, brightness: int) -> None:
+        """Update the physical Deck brightness without reopening the device."""
+        logger = logging.getLogger(__name__)
+        if self.deck is None:
+            raise DeviceError("Stream Deck is not open")
+        try:
+            logger.debug("set_brightness: calling deck.set_brightness(%d)", brightness)
+            self.deck.set_brightness(brightness)
+            logger.debug("set_brightness: deck.set_brightness(%d) returned OK", brightness)
+        except Exception as exc:
+            logger.error("set_brightness: deck.set_brightness(%d) failed: %s", brightness, exc)
+            raise DeviceError(f"Failed to set Stream Deck brightness: {exc}") from exc
 
     def __exit__(
         self,

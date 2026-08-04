@@ -21,6 +21,16 @@ plugins:
     cookie_name: __Secure-session
     request_timeout_seconds: 15.0
     refresh_interval_seconds: 60.0
+  claude_code:
+    enabled: false
+    claude_path: null
+    claude_home: null
+    plugin_dir: null
+    max_sessions: 15
+  codex:
+    enabled: false
+    codex_path: null
+    codex_home: null
 buttons:
 - key_index: 0
   plugin: opencode

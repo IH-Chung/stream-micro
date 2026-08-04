@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -15,17 +16,27 @@ from fastapi.staticfiles import StaticFiles
 from .bridge import BridgeError, BridgeService
 from .control_config import ControlConfigError
 from .device import DeviceError, discover_mk2_devices
+from .plugins.claude_code import ClaudeCodeError
+from .plugins.codex import CodexError
 from .plugins.opencode import OpenCodeError
 
 
 def create_app(config_path: Path | str, *, service: BridgeService | None = None) -> FastAPI:
     service = service or BridgeService(config_path)
-    app = FastAPI(title="Deck Bridge", docs_url=None, redoc_url=None)
+
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        try:
+            yield
+        finally:
+            service.close()
+
+    app = FastAPI(title="Deck Bridge", docs_url=None, redoc_url=None, lifespan=lifespan)
     app.state.bridge = service
 
     @app.get("/api/config")
     def get_config() -> dict[str, Any]:
-        return service.config_data()
+        return service.public_config_data()
 
     @app.put("/api/config")
     def put_config(data: dict[str, Any]) -> dict[str, Any]:
@@ -37,6 +48,12 @@ def create_app(config_path: Path | str, *, service: BridgeService | None = None)
     @app.get("/api/plugins")
     def get_plugins() -> list[dict[str, Any]]:
         return service.manifests()
+
+    @app.get("/api/plugins/snapshots")
+    def get_plugin_snapshots() -> dict[str, dict[str, Any]]:
+        """Return display-ready data keyed by provider ID."""
+
+        return service.snapshots_data()
 
     @app.get("/api/devices")
     def get_devices() -> list[dict[str, str | int | None]]:
@@ -69,7 +86,25 @@ def create_app(config_path: Path | str, *, service: BridgeService | None = None)
 
         try:
             return service.select_session_in_openchamber(session_id)
-        except (BridgeError, OpenCodeError) as exc:
+        except (BridgeError, CodexError, OpenCodeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/hooks/claude-code")
+    def post_claude_code_hook(data: dict[str, Any]) -> dict[str, str | bool | None]:
+        """Accept loopback lifecycle events from the bundled Claude Code hook."""
+
+        try:
+            return service.handle_claude_code_hook(data)
+        except (BridgeError, ClaudeCodeError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/api/hooks/claude-code/quota")
+    def post_claude_code_quota(data: dict[str, Any]) -> dict[str, str | bool | None]:
+        """Accept quota fields from a local Claude Code status-line command."""
+
+        try:
+            return service.handle_claude_code_quota(data)
+        except (BridgeError, ClaudeCodeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/opencode/sessions/{session_id}/capture-window")
@@ -107,14 +142,14 @@ def create_app(config_path: Path | str, *, service: BridgeService | None = None)
             raise HTTPException(status_code=422, detail="plugin, action, and params are required")
         try:
             return service.invoke(plugin, action, params)
-        except (BridgeError, OpenCodeError) as exc:
+        except (BridgeError, ClaudeCodeError, CodexError, OpenCodeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/deck/keys/{key_index}/press")
     def post_deck_key_press(key_index: int) -> dict[str, Any]:
         try:
             return service.press_key(key_index)
-        except (BridgeError, OpenCodeError) as exc:
+        except (BridgeError, ClaudeCodeError, CodexError, OpenCodeError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/events")

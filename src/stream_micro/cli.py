@@ -87,6 +87,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not args.bridge_config.exists():
                 write_control_config(args.bridge_config, default_control_config())
                 print(f"stream-micro: created Bridge configuration at {args.bridge_config}")
+            logging.basicConfig(
+                level=os.environ.get("STREAM_MICRO_LOG", "INFO").upper(),
+                format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            )
             from uvicorn import run as run_server
 
             bridge_config = load_control_config(args.bridge_config)

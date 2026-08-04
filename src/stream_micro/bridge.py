@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,8 @@ from .openchamber import (
     select_openchamber_session,
 )
 from .plugins.base import AgentSession, BridgePlugin, PluginSnapshot
+from .plugins.claude_code import ClaudeCodePlugin
+from .plugins.codex import CodexPlugin
 from .plugins.ollama_quota import OllamaQuotaPlugin
 from .plugins.opencode import OpenCodePlugin
 from .windows import (
@@ -45,7 +48,10 @@ class BridgeService:
         self.openchamber = None if plugins is not None else discover_openchamber_desktop()
         self.plugins = plugins or self._build_plugins(self.config, self.openchamber)
         self.selected_session_id: str | None = None
+        self.selected_session_ids: dict[str, str] = {}
         self.pending_window_bindings: dict[str, dict[str, str]] = {}
+        self.active_sessions_by_plugin: dict[str, tuple[AgentSession, ...]] = {}
+        # Compatibility for callers that still populate the OpenCode list directly.
         self.active_sessions: tuple[AgentSession, ...] = ()
         self.device_status: dict[str, Any] = {
             "connected": False,
@@ -69,25 +75,52 @@ class BridgeService:
         ollama = config.plugins.get("ollama_quota")
         if ollama is not None:
             plugins["ollama_quota"] = OllamaQuotaPlugin(ollama)
+        codex = config.plugins.get("codex")
+        if codex and codex.get("enabled", False):
+            plugins["codex"] = CodexPlugin(codex)
+        claude_code = config.plugins.get("claude_code")
+        if claude_code and claude_code.get("enabled", False):
+            plugins["claude_code"] = ClaudeCodePlugin(claude_code)
         return plugins
 
     def config_data(self) -> dict[str, Any]:
         return control_config_data(self.config)
 
+    def public_config_data(self) -> dict[str, Any]:
+        """Return browser-safe configuration without persisted credentials."""
+
+        data = self.config_data()
+        ollama = data.get("plugins", {}).get("ollama_quota")
+        if isinstance(ollama, dict):
+            cookie = ollama.get("cookie_value")
+            ollama["cookie_configured"] = isinstance(cookie, str) and bool(cookie)
+            ollama["cookie_value"] = ""
+        return data
+
     def replace_config(self, data: dict[str, Any]) -> dict[str, Any]:
-        config = parse_control_config(data)
+        normalized = deepcopy(data)
+        ollama = normalized.get("plugins", {}).get("ollama_quota")
+        if isinstance(ollama, dict):
+            configured = ollama.pop("cookie_configured", False)
+            if ollama.get("cookie_value") == "" and configured is True:
+                existing = self.config.plugins.get("ollama_quota", {}).get("cookie_value")
+                if isinstance(existing, str) and existing:
+                    ollama["cookie_value"] = existing
+        config = parse_control_config(normalized)
         write_control_config(self.config_path, config)
+        old_plugins = self.plugins
         self.config = config
         self.plugins = self._build_plugins(config, self.openchamber)
-        if self.selected_session_id is not None:
-            known_ids = {
-                session.id
-                for snapshot in self.snapshots().values()
-                for session in snapshot.sessions
-            }
-            if self.selected_session_id not in known_ids:
-                self.selected_session_id = None
-        return self.config_data()
+        self._close_plugins(old_plugins)
+        enabled = set(self.plugins)
+        self.selected_session_ids = {
+            plugin_id: session_id
+            for plugin_id, session_id in self.selected_session_ids.items()
+            if plugin_id in enabled
+        }
+        if self.selected_session_id not in self.selected_session_ids.values():
+            self.selected_session_id = None
+        return self.public_config_data()
 
     def manifests(self) -> list[dict[str, Any]]:
         return [asdict(plugin.manifest) for plugin in self.plugins.values()]
@@ -95,11 +128,25 @@ class BridgeService:
     def snapshots(self) -> dict[str, PluginSnapshot]:
         return {plugin_id: plugin.snapshot() for plugin_id, plugin in self.plugins.items()}
 
+    def snapshots_data(self) -> dict[str, dict[str, Any]]:
+        """Return every provider snapshot without hard-coding a session source."""
+
+        return {plugin_id: asdict(snapshot) for plugin_id, snapshot in self.snapshots().items()}
+
+    def set_active_snapshots(self, snapshots: dict[str, PluginSnapshot]) -> None:
+        """Cache the exact per-provider session lists currently rendered on the Deck."""
+
+        self.active_sessions_by_plugin = {
+            plugin_id: snapshot.sessions for plugin_id, snapshot in snapshots.items()
+        }
+        self.active_sessions = self.active_sessions_by_plugin.get("opencode", ())
+
     def status_data(self, *, include_plugins: bool = True) -> dict[str, Any]:
         """Return Bridge state, optionally without expensive Plugin snapshots."""
 
         status: dict[str, Any] = {
             "selected_session_id": self.selected_session_id,
+            "selected_session_ids": dict(self.selected_session_ids),
             "pending_window_bindings": self.pending_window_bindings,
             "device": self.device_status,
             "openchamber": {
@@ -177,6 +224,7 @@ class BridgeService:
     def _select_openchamber_session(self, session: AgentSession) -> None:
         self.select_openchamber_session(session)
         self.selected_session_id = session.id
+        self.selected_session_ids["opencode"] = session.id
         plugin = self.plugins.get("opencode")
         if isinstance(plugin, OpenCodePlugin):
             plugin.mark_viewed(session.id)
@@ -218,38 +266,39 @@ class BridgeService:
     def _press_span_child(
         self, parent: ButtonBinding, key_index: int
     ) -> dict[str, Any]:
+        if not parent.plugin or not parent.action:
+            return {"result": "no_action"}
+        sessions = self._sessions_for_plugin(parent.plugin)
         slot = key_index - parent.key_index
         # span > 1: sessions auto-assigned by slot, ignore session_id.
         # span = 1: session_id pins to one session; fallback to slot 0.
         if parent.span > 1:
-            if slot < len(self.active_sessions):
-                session = self.active_sessions[slot]
-                self._select_openchamber_session(session)
-                return {
-                    "result": "session_selected_in_openchamber",
-                    "session_id": session.id,
-                }
+            if slot < len(sessions):
+                session = sessions[slot]
+                params = {**parent.action_params, "session_id": session.id}
+                return self.invoke(parent.plugin, parent.action, params)
             return {"result": "no_action"}
         if parent.session_id:
             session = next(
-                (s for s in self.active_sessions if s.id == parent.session_id),
+                (s for s in sessions if s.id == parent.session_id),
                 None,
             )
             if session is None:
                 raise BridgeError(f"Session {parent.session_id} is no longer active")
-            self._select_openchamber_session(session)
-            return {
-                "result": "session_selected_in_openchamber",
-                "session_id": session.id,
-            }
-        if self.active_sessions:
-            session = self.active_sessions[0]
-            self._select_openchamber_session(session)
-            return {
-                "result": "session_selected_in_openchamber",
-                "session_id": session.id,
-            }
+            params = {**parent.action_params, "session_id": session.id}
+            return self.invoke(parent.plugin, parent.action, params)
+        if sessions:
+            params = {**parent.action_params, "session_id": sessions[0].id}
+            return self.invoke(parent.plugin, parent.action, params)
         return {"result": "no_action"}
+
+    def _sessions_for_plugin(self, plugin_id: str) -> tuple[AgentSession, ...]:
+        sessions = self.active_sessions_by_plugin.get(plugin_id)
+        if sessions is not None:
+            return sessions
+        if plugin_id == "opencode":
+            return self.active_sessions
+        return ()
 
     def opencode_servers(self) -> list[dict[str, str]]:
         plugin = self._plugin("opencode")
@@ -262,6 +311,18 @@ class BridgeService:
         if not isinstance(plugin, OpenCodePlugin):
             raise BridgeError("OpenCode plugin is not enabled")
         return [asdict(session) for session in plugin.sessions()]
+
+    def handle_claude_code_hook(self, payload: dict[str, Any]) -> dict[str, str | bool | None]:
+        plugin = self._plugin("claude_code")
+        if not isinstance(plugin, ClaudeCodePlugin):
+            raise BridgeError("Claude Code plugin is not enabled")
+        return plugin.handle_hook(payload)
+
+    def handle_claude_code_quota(self, payload: dict[str, Any]) -> dict[str, str | bool | None]:
+        plugin = self._plugin("claude_code")
+        if not isinstance(plugin, ClaudeCodePlugin):
+            raise BridgeError("Claude Code plugin is not enabled")
+        return plugin.handle_quota(payload)
 
     def invoke(self, plugin_id: str, action: str, params: dict[str, Any]) -> Any:
         plugin = self._plugin(plugin_id)
@@ -276,10 +337,26 @@ class BridgeService:
             if not isinstance(session_id, str) or not session_id:
                 raise BridgeError("select_session requires session_id")
             return self.select_session_in_openchamber(session_id)
-        return plugin.invoke(action, params)
+        result = plugin.invoke(action, params)
+        if action == "select_session":
+            session_id = params.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.selected_session_id = session_id
+                self.selected_session_ids[plugin_id] = session_id
+        return result
 
     def _plugin(self, plugin_id: str) -> BridgePlugin:
         try:
             return self.plugins[plugin_id]
         except KeyError as exc:
             raise BridgeError(f"Plugin {plugin_id} is not enabled") from exc
+
+    @staticmethod
+    def _close_plugins(plugins: dict[str, BridgePlugin]) -> None:
+        for plugin in plugins.values():
+            close = getattr(plugin, "close", None)
+            if callable(close):
+                close()
+
+    def close(self) -> None:
+        self._close_plugins(self.plugins)

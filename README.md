@@ -47,9 +47,32 @@ so both surfaces use the same OpenCode Server.
 ## Plugins
 
 Plugins expose a manifest, configuration validation, a status snapshot, and a
-strict allowlist of actions. OpenCode is the interactive plugin. `ollama_quota`
-is a separate display-only plugin; enable it in `bridge.yaml` only if you retain
-the legacy Ollama configuration.
+strict allowlist of actions. OpenCode, Codex, and Claude Code can each supply
+Session keys. `ollama_quota` is a separate display-only plugin; enable it in
+`bridge.yaml` only if you retain the legacy Ollama configuration.
+
+### Claude Code Sessions and quota
+
+Enable `plugins.claude_code` in the Dashboard or `bridge.yaml`. The provider
+reads recent Session IDs and titles from the local Claude Code history without
+copying credentials. The bundled companion hook supplies live `RUNNING`,
+`WAITING`, `COMPLETED`, and `ERROR` state:
+
+```powershell
+claude --plugin-dir integrations/claude-code-stream-micro
+```
+
+Set `plugins.claude_code.plugin_dir` to that integration folder so a physical
+Session-key press resumes the exact Session with the hook enabled. The action
+uses Claude Code's official `--resume <session-id>` CLI option and opens it in a
+new Windows console. The hook reports to the loopback-only Bridge endpoint and
+silently does nothing when Bridge is stopped.
+
+Claude Code exposes Pro/Max subscription usage through its status-line input.
+Point `~/.claude/settings.json` at the bundled `scripts/report-quota.mjs` as
+shown in the companion integration README. After the first API response, the
+Bridge displays the official 5-hour and 7-day usage percentages and reset times
+on Claude Code quota keys and in the Dashboard.
 
 ## Verify
 

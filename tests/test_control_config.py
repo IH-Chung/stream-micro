@@ -22,6 +22,7 @@ def test_default_control_config_has_mk2_layout_and_span_session_zone() -> None:
     assert config.buttons[0].span == 5
     assert config.buttons[1].component is None
     assert config.buttons[5].component is None
+    assert config.plugins["claude_code"]["enabled"] is False
 
 
 def test_legacy_five_session_keys_migrate_to_one_span_zone() -> None:

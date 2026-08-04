@@ -15,31 +15,33 @@ type Button = {
 type OllamaQuotaConfig = {
   enabled?: boolean;
   cookie_value?: string;
+  cookie_configured?: boolean;
   settings_url?: string;
   cookie_name?: string;
   request_timeout_seconds?: number;
   refresh_interval_seconds?: number;
 };
-type PluginConfig =
-  | { enabled?: boolean; endpoints?: string[] }
-  | OllamaQuotaConfig;
+type CodexConfig = { enabled?: boolean; codex_path?: string | null; codex_home?: string | null };
+type ClaudeCodeConfig = { enabled?: boolean; claude_path?: string | null; claude_home?: string | null; plugin_dir?: string | null; max_sessions?: number };
+type OpenCodeConfig = { enabled?: boolean; endpoints?: string[]; password_env?: string | null };
+type PluginConfig = { enabled?: boolean; [key: string]: unknown };
 type Config = {
   stream_deck: { brightness: number; device_serial: string | null };
   plugins: Record<string, PluginConfig>;
   buttons: Button[];
 };
-type Session = { id: string; title: string; state: string; project: string | null };
+type Session = { id: string; title: string; state: string; project: string | null; directory?: string | null };
 type PluginManifest = { id: string; name: string; components: string[]; actions: string[] };
 type PluginHealth = { connected: boolean; detail: string; endpoint?: string | null };
 type PluginSnapshot = {
   health: PluginHealth;
-  sessions?: unknown[];
+  sessions?: Session[];
   signals?: Record<string, string | number | null> | null;
 };
 type BridgeStatus = {
   selected_session_id?: string | null;
+  selected_session_ids?: Record<string, string>;
   device: { connected: boolean; detail: string; key_count?: number };
-  plugins?: Record<string, PluginSnapshot>;
 };
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
@@ -53,30 +55,66 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   return response.json();
 }
 
-function displayName(value: string | null) {
+function displayName(value: string | null | undefined) {
   return value ? value.replace(/_/g, " ").replace(/\b\w/g, (letter: string) => letter.toUpperCase()) : "Not configured";
 }
 
 const SESSION_STATE_COLORS: Record<string, string> = {
   idle: "#ffffff",
-  running: "#4d9de5",
-  waiting: "#e5a23b",
-  completed: "#4de57a",
-  error: "#e55d5d",
-  disconnected: "#555555",
+  running: "#66d9ff",
+  waiting: "#ffc15a",
+  completed: "#5af08c",
+  error: "#ff7983",
+  disconnected: "#6f8099",
 };
 
 function sessionStateColor(state: string) {
   return SESSION_STATE_COLORS[state] ?? "#71819a";
 }
 
-function OllamaQuotaCard({ config, status, updateConfig }: {
+function formatReset(value: string | number | null | undefined) {
+  if (!value || typeof value !== "string") return "—";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.valueOf()) ? value : parsed.toLocaleString();
+}
+
+function pctColor(pct: number | null | undefined) {
+  if (pct == null) return "#71819a";
+  if (pct >= 90) return "#ef4444";
+  if (pct >= 70) return "#f59e0b";
+  return "#4de57a";
+}
+
+function UsageBars({ signals, generic = false }: {
+  signals: Record<string, string | number | null>;
+  generic?: boolean;
+}) {
+  const primary = (generic ? signals.primary_percent : signals.session_percent) as number | null;
+  const secondary = (generic ? signals.secondary_percent : signals.weekly_percent) as number | null;
+  const primaryReset = generic ? signals.primary_reset_at : signals.session_reset_at;
+  const secondaryReset = generic ? signals.secondary_reset_at : signals.weekly_reset_at;
+  const primaryLabel = generic ? String(signals.primary_label ?? "Primary") : "Session";
+  const secondaryLabel = generic ? String(signals.secondary_label ?? "Secondary") : "Weekly";
+  return <div className="ollama-usage-grid">
+    <div className="usage-bar">
+      <div className="usage-bar-label"><span>{primaryLabel}</span><b style={{ color: pctColor(primary) }}>{primary != null ? `${primary}%` : "—"}</b></div>
+      <div className="usage-bar-track"><div className="usage-bar-fill" style={{ width: `${primary ?? 0}%`, background: pctColor(primary) }} /></div>
+      <small>Resets: {formatReset(primaryReset)}</small>
+    </div>
+    <div className="usage-bar">
+      <div className="usage-bar-label"><span>{secondaryLabel}</span><b style={{ color: pctColor(secondary) }}>{secondary != null ? `${secondary}%` : "—"}</b></div>
+      <div className="usage-bar-track"><div className="usage-bar-fill" style={{ width: `${secondary ?? 0}%`, background: pctColor(secondary) }} /></div>
+      <small>Resets: {formatReset(secondaryReset)}</small>
+    </div>
+  </div>;
+}
+
+function OllamaQuotaCard({ config, snapshot, updateConfig }: {
   config: Config | null;
-  status: BridgeStatus | null;
+  snapshot?: PluginSnapshot;
   updateConfig: (change: (current: Config) => Config) => void;
 }) {
   const pluginConfig = config?.plugins?.ollama_quota as OllamaQuotaConfig | undefined;
-  const snapshot = status?.plugins?.ollama_quota;
   const health = snapshot?.health;
   const signals = snapshot?.signals;
 
@@ -85,40 +123,25 @@ function OllamaQuotaCard({ config, status, updateConfig }: {
       ...current,
       plugins: {
         ...current.plugins,
-        ollama_quota: { ...current.plugins?.ollama_quota, [field]: value } as OllamaQuotaConfig,
+        ollama_quota: { ...current.plugins?.ollama_quota, [field]: value },
       },
     }));
-  };
-
-  const formatReset = (value: string | number | null | undefined) => {
-    if (!value || typeof value !== "string") return "—";
-    try {
-      return new Date(value).toLocaleString();
-    } catch {
-      return value;
-    }
-  };
-
-  const pctColor = (pct: number | null | undefined) => {
-    if (pct == null) return "#71819a";
-    if (pct >= 90) return "#ef4444";
-    if (pct >= 70) return "#f59e0b";
-    return "#4de57a";
   };
 
   return <section className="panel ollama-card">
     <p>OLLAMA USAGE</p>
     <h2>Quota</h2>
+    <label className="toggle-field ollama-toggle"><input type="checkbox" checked={pluginConfig?.enabled ?? false} onChange={(event) => setField("enabled", event.target.checked)} /> Enable Ollama Cloud quota provider</label>
     <div className="ollama-cookie-field">
       <label>Session cookie value
         <input
           type="password"
-          placeholder="Paste ollama.com __Secure-session cookie value"
+          placeholder={pluginConfig?.cookie_configured ? "Cookie configured — enter a new value to replace it" : "Paste ollama.com __Secure-session cookie value"}
           value={pluginConfig?.cookie_value ?? ""}
           onChange={(event) => setField("cookie_value", event.target.value)}
         />
       </label>
-      <p className="ollama-hint">Sign in at ollama.com, open DevTools → Application → Cookies, copy the <code>__Secure-session</code> value.</p>
+      <p className="ollama-hint">{pluginConfig?.cookie_configured ? "The saved cookie stays in the local Bridge and is never returned to this page." : <>Sign in at ollama.com, open DevTools → Application → Cookies, copy the <code>__Secure-session</code> value.</>}</p>
     </div>
     <details className="ollama-advanced">
       <summary>Advanced settings</summary>
@@ -141,26 +164,124 @@ function OllamaQuotaCard({ config, status, updateConfig }: {
         <span>{health.detail}</span>
       </div>
     )}
-    {signals && (
-      <div className="ollama-usage-grid">
-        <div className="usage-bar">
-          <div className="usage-bar-label"><span>Session</span><b style={{ color: pctColor(signals.session_percent as number | null) }}>{signals.session_percent != null ? `${signals.session_percent}%` : "—"}</b></div>
-          <div className="usage-bar-track"><div className="usage-bar-fill" style={{ width: `${signals.session_percent ?? 0}%`, background: pctColor(signals.session_percent as number | null) }} /></div>
-          <small>Resets: {formatReset(signals.session_reset_at)}</small>
-        </div>
-        <div className="usage-bar">
-          <div className="usage-bar-label"><span>Weekly</span><b style={{ color: pctColor(signals.weekly_percent as number | null) }}>{signals.weekly_percent != null ? `${signals.weekly_percent}%` : "—"}</b></div>
-          <div className="usage-bar-track"><div className="usage-bar-fill" style={{ width: `${signals.weekly_percent ?? 0}%`, background: pctColor(signals.weekly_percent as number | null) }} /></div>
-          <small>Resets: {formatReset(signals.weekly_reset_at)}</small>
-        </div>
-      </div>
-    )}
+    {signals && <UsageBars signals={signals} />}
+  </section>;
+}
+
+function CodexCard({ config, snapshot, updateConfig }: {
+  config: Config | null;
+  snapshot?: PluginSnapshot;
+  updateConfig: (change: (current: Config) => Config) => void;
+}) {
+  const pluginConfig = config?.plugins?.codex as CodexConfig | undefined;
+  const setField = (field: keyof CodexConfig, value: string | boolean | null) => {
+    updateConfig((current) => ({
+      ...current,
+      plugins: {
+        ...current.plugins,
+        codex: { ...current.plugins.codex, [field]: value },
+      },
+    }));
+  };
+  return <section className="panel ollama-card codex-card">
+    <p>CODEX APP SERVER</p>
+    <h2>Chats &amp; quota</h2>
+    <label className="toggle-field"><input type="checkbox" checked={pluginConfig?.enabled ?? false} onChange={(event) => setField("enabled", event.target.checked)} /> Enable Codex provider</label>
+    <details className="ollama-advanced">
+      <summary>Advanced settings</summary>
+      <label>Codex executable
+        <input type="text" placeholder="codex (use PATH)" value={pluginConfig?.codex_path ?? ""} onChange={(event) => setField("codex_path", event.target.value || null)} />
+      </label>
+      <label>CODEX_HOME
+        <input type="text" placeholder="Use current Codex home" value={pluginConfig?.codex_home ?? ""} onChange={(event) => setField("codex_home", event.target.value || null)} />
+      </label>
+    </details>
+    {snapshot?.health && <div className={`ollama-health ${snapshot.health.connected ? "is-connected" : "is-error"}`}><span className="health-dot" /><span>{snapshot.health.detail}</span></div>}
+    <div className="codex-session-summary"><b>{snapshot?.sessions?.length ?? 0}</b><span>recent Codex chats available to session keys</span></div>
+    {snapshot?.signals && <UsageBars signals={snapshot.signals} generic />}
+  </section>;
+}
+
+function ClaudeCodeCard({ config, snapshot, updateConfig }: {
+  config: Config | null;
+  snapshot?: PluginSnapshot;
+  updateConfig: (change: (current: Config) => Config) => void;
+}) {
+  const pluginConfig = config?.plugins?.claude_code as ClaudeCodeConfig | undefined;
+  const setField = (field: keyof ClaudeCodeConfig, value: string | number | boolean | null) => {
+    updateConfig((current) => ({
+      ...current,
+      plugins: {
+        ...current.plugins,
+        claude_code: { ...current.plugins.claude_code, [field]: value },
+      },
+    }));
+  };
+  return <section className="panel provider-card claude-code-card">
+    <p>CLAUDE CODE</p>
+    <h2>Sessions &amp; quota</h2>
+    <label className="toggle-field claude-code-toggle"><input type="checkbox" checked={pluginConfig?.enabled ?? false} onChange={(event) => setField("enabled", event.target.checked)} /> Enable Claude Code provider</label>
+    <details className="ollama-advanced">
+      <summary>Advanced settings</summary>
+      <label>Claude executable
+        <input type="text" placeholder="claude (use PATH)" value={pluginConfig?.claude_path ?? ""} onChange={(event) => setField("claude_path", event.target.value || null)} />
+      </label>
+      <label>Claude data folder
+        <input type="text" placeholder="Use current ~/.claude folder" value={pluginConfig?.claude_home ?? ""} onChange={(event) => setField("claude_home", event.target.value || null)} />
+      </label>
+      <label>Companion plugin folder
+        <input type="text" placeholder="Optional path to the bundled integration" value={pluginConfig?.plugin_dir ?? ""} onChange={(event) => setField("plugin_dir", event.target.value || null)} />
+      </label>
+      <label>Recent Sessions
+        <input type="number" min={1} max={15} value={pluginConfig?.max_sessions ?? 15} onChange={(event) => setField("max_sessions", Number(event.target.value))} />
+      </label>
+    </details>
+    {snapshot?.health && <div className={`ollama-health ${snapshot.health.connected ? "is-connected" : "is-error"}`}><span className="health-dot" /><span>{snapshot.health.detail}</span></div>}
+    <div className="codex-session-summary"><b>{snapshot?.sessions?.length ?? 0}</b><span>recent Claude Code Sessions available to button zones</span></div>
+    {snapshot?.signals && <UsageBars signals={snapshot.signals} generic />}
+    <p className="provider-note">The companion hook adds live Session status. Quota appears after Claude Code's status line receives its first API response.</p>
+  </section>;
+}
+
+function OpenCodeCard({ config, snapshot, updateConfig }: {
+  config: Config | null;
+  snapshot?: PluginSnapshot;
+  updateConfig: (change: (current: Config) => Config) => void;
+}) {
+  const pluginConfig = config?.plugins?.opencode as OpenCodeConfig | undefined;
+  const setField = (field: keyof OpenCodeConfig, value: boolean | string[] | string | null) => {
+    updateConfig((current) => ({
+      ...current,
+      plugins: {
+        ...current.plugins,
+        opencode: { ...current.plugins.opencode, [field]: value },
+      },
+    }));
+  };
+  return <section className="panel provider-card opencode-card">
+    <p>OPENCODE SERVERS</p>
+    <h2>Sessions</h2>
+    <label className="toggle-field opencode-toggle"><input type="checkbox" checked={pluginConfig?.enabled ?? false} onChange={(event) => setField("enabled", event.target.checked)} /> Enable OpenCode provider</label>
+    <label>Server endpoints
+      <textarea
+        rows={3}
+        placeholder="One endpoint per line"
+        value={(pluginConfig?.endpoints ?? []).join("\n")}
+        onChange={(event) => setField("endpoints", event.target.value.split(/\r?\n/).map((value) => value.trim()).filter(Boolean))}
+      />
+    </label>
+    <label>Password environment variable
+      <input type="text" placeholder="Optional" value={pluginConfig?.password_env ?? ""} onChange={(event) => setField("password_env", event.target.value || null)} />
+    </label>
+    {snapshot?.health && <div className={`ollama-health ${snapshot.health.connected ? "is-connected" : "is-error"}`}><span className="health-dot" /><span>{snapshot.health.detail}</span></div>}
+    <div className="codex-session-summary"><b>{snapshot?.sessions?.length ?? 0}</b><span>OpenCode sessions available to button zones</span></div>
   </section>;
 }
 
 function App() {
+  const [activeTab, setActiveTab] = useState<"buttons" | "configuration">("buttons");
   const [config, setConfig] = useState<Config | null>(null);
-  const [sessions, setSessions] = useState<Session[]>([]);
+  const [snapshots, setSnapshots] = useState<Record<string, PluginSnapshot>>({});
   const [manifests, setManifests] = useState<PluginManifest[]>([]);
   const [status, setStatus] = useState<BridgeStatus | null>(null);
   const [editingKey, setEditingKey] = useState(0);
@@ -175,14 +296,14 @@ function App() {
     if (refreshInFlightRef.current) return;
     refreshInFlightRef.current = true;
     try {
-      const [nextConfig, nextSessions, nextManifests, nextStatus] = await Promise.all([
+      const [nextConfig, nextSnapshots, nextManifests, nextStatus] = await Promise.all([
         api<Config>("config"),
-        api<Session[]>("opencode/sessions"),
+        api<Record<string, PluginSnapshot>>("plugins/snapshots"),
         api<PluginManifest[]>("plugins"),
-        api<BridgeStatus>("status"),
+        api<BridgeStatus>("status?include_plugins=false"),
       ]);
       if (replaceLocalConfig || !dirtyRef.current) setConfig(nextConfig);
-      setSessions(nextSessions);
+      setSnapshots(nextSnapshots);
       setManifests(nextManifests);
       setStatus(nextStatus);
       if (!dirtyRef.current) setNotice("");
@@ -208,6 +329,9 @@ function App() {
 
   const selectedBinding = config?.buttons.find((button) => button.key_index === editingKey) ?? null;
   const selectedManifest = manifests.find((manifest) => manifest.id === selectedBinding?.plugin) ?? null;
+  const sessionsForPlugin = (pluginId: string | null | undefined) => pluginId ? snapshots[pluginId]?.sessions ?? [] : [];
+  const totalSessions = Object.values(snapshots).reduce((total, snapshot) => total + (snapshot.sessions?.length ?? 0), 0);
+  const selectedProviderSessions = sessionsForPlugin(selectedBinding?.plugin);
 
   // Build span zone lookup: key_index -> zone parent Button
   const spanZones: Map<number, Button> = new Map();
@@ -222,6 +346,7 @@ function App() {
   const sessionFor = (keyIndex: number) => {
     const parent = spanZones.get(keyIndex);
     if (!parent) return null;
+    const sessions = sessionsForPlugin(parent.plugin);
     // When span > 1, sessions are auto-assigned by slot — ignore session_id.
     // session_id only applies to span=1 (single-key pinned to one session).
     if (parent.span > 1) {
@@ -507,28 +632,55 @@ function App() {
       </div>
     </header>
     {notice && <div className="notice">{notice}</div>}
-    <div className="workspace">
+    <nav className="page-tabs" role="tablist" aria-label="Deck Bridge sections">
+      <button
+        type="button"
+        role="tab"
+        aria-selected={activeTab === "buttons"}
+        className={activeTab === "buttons" ? "is-active" : ""}
+        onClick={() => setActiveTab("buttons")}
+      >
+        <span>Buttons</span>
+        <small>Deck layout and actions</small>
+      </button>
+      <button
+        type="button"
+        role="tab"
+        aria-selected={activeTab === "configuration"}
+        className={activeTab === "configuration" ? "is-active" : ""}
+        onClick={() => setActiveTab("configuration")}
+      >
+        <span>Configuration</span>
+        <small>Hardware, providers and quota</small>
+      </button>
+    </nav>
+    {activeTab === "buttons" ? <div className="workspace" role="tabpanel" aria-label="Button configuration">
       <section className="deck-panel panel">
         <div className="section-heading">
-          <div><p>MK.2 CONFIGURATION PREVIEW</p><h2>Choose a key to edit</h2><span>This browser preview never runs a key action. Only the physical Stream Deck does.</span></div>
-          <div className="session-count"><b>{sessions.length}</b><span>live sessions</span></div>
+          <div><p>MK.2 BUTTON LAYOUT</p><h2>Choose a key to edit</h2><span>This browser preview never runs a key action. Only the physical Stream Deck does.</span></div>
+          <div className="session-count"><b>{totalSessions}</b><span>provider sessions</span></div>
         </div>
         <div className="deck-frame"><div className="deck-grid">
           {Array.from({ length: 15 }, (_, index) => {
             const button = config?.buttons.find((item) => item.key_index === index);
             const session = sessionFor(index);
             const parent = spanZones.get(index);
+            const pluginId = parent?.plugin ?? button?.plugin;
+            const snapshot = pluginId ? snapshots[pluginId] : undefined;
             const isChild = parent !== undefined && parent.key_index !== index;
             const isParent = parent !== undefined && parent.key_index === index;
-            const label = session?.title ?? (isChild ? "Session slot" : displayName(button?.component ?? null));
-            const sublabel = session?.project ?? (isChild ? `Slot ${index - (parent?.key_index ?? 0) + 1}` : button?.plugin ? displayName(button.plugin) : "Unassigned");
-            const state = session?.state ?? (button?.action ? displayName(button.action) : "No action");
+            const isQuota = button?.component === "quota";
+            const quotaPercent = snapshot?.signals?.primary_percent ?? snapshot?.signals?.session_percent;
+            const label = session?.title ?? (isQuota ? `${displayName(pluginId)} quota` : isChild ? "Session slot" : displayName(button?.component ?? null));
+            const sublabel = session ? `${displayName(pluginId)} · ${session.project ?? "No project"}` : isChild ? `${displayName(pluginId)} · slot ${index - (parent?.key_index ?? 0) + 1}` : pluginId ? displayName(pluginId) : "Unassigned";
+            const state = session?.state ?? (isQuota && quotaPercent != null ? `${quotaPercent}% used` : snapshot && !snapshot.health.connected ? snapshot.health.detail : button?.action ? displayName(button.action) : "No action");
+            const stateColor = session ? sessionStateColor(session.state) : isQuota && typeof quotaPercent === "number" ? pctColor(quotaPercent) : undefined;
             return <button
               key={index}
               type="button"
               draggable
               title={`Edit key ${index + 1}: ${label} — drag to rearrange`}
-              className={`deck-key ${session ? "session-key" : "utility-key"} ${editingKey === index ? "is-editing" : ""} ${isParent && parent && parent.span > 1 ? "is-zone-parent" : ""} ${isChild ? "is-zone-child" : ""} ${dragSource === index ? "is-dragging" : ""} ${dragOver === index && dragSource !== null && dragSource !== index ? "is-drop-target" : ""}`}
+              className={`deck-key ${session ? "session-key" : "utility-key"} provider-${pluginId ?? "none"} ${editingKey === index ? "is-editing" : ""} ${isParent && parent && parent.span > 1 ? "is-zone-parent" : ""} ${isChild ? "is-zone-child" : ""} ${dragSource === index ? "is-dragging" : ""} ${dragOver === index && dragSource !== null && dragSource !== index ? "is-drop-target" : ""}`}
               aria-pressed={editingKey === index}
               onClick={() => setEditingKey(index)}
               onDragStart={() => handleDragStart(index)}
@@ -536,7 +688,7 @@ function App() {
               onDragOver={(event) => handleDragOver(event, index)}
               onDragLeave={handleDragLeave}
               onDrop={() => handleDrop(index)}
-            ><span className="key-index">{index + 1}</span><strong>{label}</strong><small>{sublabel}</small><em>{state}</em><span className="drag-handle" aria-hidden="true">⠿</span></button>;
+            ><span className="key-index">{index + 1}</span><strong>{label}</strong><small>{sublabel}</small><em style={stateColor ? { color: stateColor } : undefined}>{state}</em><span className="drag-handle" aria-hidden="true">⠿</span></button>;
           })}
         </div></div>
         <div className="deck-legend"><span><i className="legend-dot editing-dot" /> Editing key</span><span><i className="legend-dot session-dot" /> Live Session display</span><span><i className="legend-dot" /> Other / unassigned</span></div>
@@ -546,7 +698,7 @@ function App() {
         <section className="panel key-editor">
           <p>KEY CONFIGURATION</p>
           <h2>Key {editingKey + 1}</h2>
-          <span className="editor-hint">Changes stay in this page until you choose Save. Clicking this preview cannot focus or control OpenChamber.</span>
+          <span className="editor-hint">Changes stay in this page until you choose Save. Clicking this preview never opens OpenChamber, Codex, or Claude Code.</span>
           <label>Plugin
             <select value={selectedBinding?.plugin ?? ""} onChange={(event) => changePlugin(event.target.value)}>
               <option value="">No plugin (unassigned)</option>
@@ -574,10 +726,16 @@ function App() {
             {selectedBinding?.plugin === "opencode" && selectedBinding.component === "session" ? <>
               <b>Session zone (span {selectedBinding.span})</b><span>This key and {(selectedBinding.span ?? 1) - 1} key{(selectedBinding.span ?? 1) > 2 ? "s" : ""} to its right show live Sessions. Each physical press focuses that slot's Session in OpenChamber.</span>
               <small>{selectedBinding.action === "select_session" ? "Physical press: focus this slot's Session in OpenChamber." : "Physical press: no Session focus action configured."}</small>
+            </> : selectedBinding?.plugin === "codex" && selectedBinding.component === "session" ? <>
+              <b>Codex chat zone (span {selectedBinding.span})</b><span>This zone follows Codex's most recently active local chats, using live turn status and Codex-specific key styling.</span>
+              <small>{selectedBinding.action === "select_session" ? "Physical press: open this exact chat in the ChatGPT desktop app." : "Physical press: no Codex chat action configured."}</small>
+            </> : selectedBinding?.plugin === "claude_code" && selectedBinding.component === "session" ? <>
+              <b>Claude Code Session zone (span {selectedBinding.span})</b><span>This zone follows recent local Claude Code Sessions and uses lifecycle hooks for live status.</span>
+              <small>{selectedBinding.action === "select_session" ? "Physical press: resume this exact Session in a new console." : "Physical press: no Claude Code Session action configured."}</small>
             </> : selectedBinding?.plugin ? <><b>{displayName(selectedBinding.component)}</b><span>This key renders the selected Plugin component when that Plugin supplies it.</span><small>Physical action: {displayName(selectedBinding.action)}</small></> : <><b>Unassigned key</b><span>Choose a Plugin and Component to define what this key displays.</span><small>No physical action is configured.</small></>}
           </div>
-          {selectedBinding?.plugin === "opencode" && selectedBinding.component === "session" && isZoneParent(editingKey) && (selectedBinding.span ?? 1) === 1 && (() => {
-            const assigned = selectedBinding.session_id ? sessions.find((session) => session.id === selectedBinding.session_id) : null;
+          {selectedBinding?.plugin && selectedBinding.component === "session" && isZoneParent(editingKey) && (selectedBinding.span ?? 1) === 1 && (() => {
+            const assigned = selectedBinding.session_id ? selectedProviderSessions.find((session) => session.id === selectedBinding.session_id) : null;
             return <div className="session-picker">
               <div className="session-picker-head">
                 <p>SESSION ASSIGNMENT</p>
@@ -585,7 +743,7 @@ function App() {
               </div>
               {selectedBinding.session_id && !assigned && <p className="session-not-found">Session not found. It may have closed. Clear the assignment to pick a new one.</p>}
               <div className="session-list">
-                {sessions.map((session) => (
+                {selectedProviderSessions.map((session) => (
                   <button
                     key={session.id}
                     type="button"
@@ -597,18 +755,34 @@ function App() {
                       <strong>{session.title || "Untitled session"}</strong>
                       <small>{session.project ?? "No project"}</small>
                     </span>
-                    <em>{session.state}</em>
+                    <em style={{ color: sessionStateColor(session.state) }}>{session.state}</em>
                   </button>
                 ))}
-                {sessions.length === 0 && <p className="session-list-empty">No live sessions available.</p>}
+                {selectedProviderSessions.length === 0 && <p className="session-list-empty">No live {displayName(selectedBinding.plugin)} sessions available.</p>}
               </div>
             </div>;
           })()}
         </section>
-        <section className="panel device-card"><p>PHYSICAL DECK</p><div><b>{status?.device.connected ? "Ready" : "Waiting"}</b><span>{status?.device.detail || "Checking hardware"}</span></div><label>Brightness<input type="range" min="0" max="100" value={config?.stream_deck.brightness ?? 40} onChange={(event) => updateConfig((current) => ({ ...current, stream_deck: { ...current.stream_deck, brightness: Number(event.target.value) } }))} /></label></section>
-        <OllamaQuotaCard config={config} status={status} updateConfig={updateConfig} />
       </aside>
-    </div>
+    </div> : <section className="configuration-page" role="tabpanel" aria-label="Bridge configuration">
+      <div className="configuration-heading">
+        <p>BRIDGE CONFIGURATION</p>
+        <h2>Hardware and providers</h2>
+        <span>Connection settings and usage data live here, separate from the physical button layout.</span>
+      </div>
+      <div className="configuration-grid">
+        <section className="panel device-card configuration-card">
+          <p>PHYSICAL DECK</p>
+          <h2>Stream Deck MK.2</h2>
+          <div><b>{status?.device.connected ? "Ready" : "Waiting"}</b><span>{status?.device.detail || "Checking hardware"}</span></div>
+          <label>Brightness<input type="range" min="0" max="100" value={config?.stream_deck.brightness ?? 40} onChange={(event) => updateConfig((current) => ({ ...current, stream_deck: { ...current.stream_deck, brightness: Number(event.target.value) } }))} /></label>
+        </section>
+        <OpenCodeCard config={config} snapshot={snapshots.opencode} updateConfig={updateConfig} />
+        <CodexCard config={config} snapshot={snapshots.codex} updateConfig={updateConfig} />
+        <ClaudeCodeCard config={config} snapshot={snapshots.claude_code} updateConfig={updateConfig} />
+        <OllamaQuotaCard config={config} snapshot={snapshots.ollama_quota} updateConfig={updateConfig} />
+      </div>
+    </section>}
   </main>;
 }
 
