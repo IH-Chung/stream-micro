@@ -260,7 +260,7 @@ def test_codex_quota_component_renders_from_the_codex_snapshot(tmp_path: Path) -
     Mk2BridgeRunner(service).refresh(cast(Mk2DeckOutput, output))
 
     assert output.brightness == [40]
-    assert output.images[5].getpixel((6, 50)) == (34, 197, 94)
+    assert output.images[5].getpixel((6, 47)) == (34, 197, 94)
 
 
 def test_codex_session_zone_uses_codex_sessions_and_codex_deep_link_action(

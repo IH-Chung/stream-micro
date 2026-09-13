@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -37,6 +38,16 @@ class BridgeError(RuntimeError):
     pass
 
 
+# Exponential backoff for re-discovering OpenChamber Desktop when it starts
+# after the Bridge.  The first retry waits ``_OPENCHAMBER_INITIAL_BACKOFF``
+# seconds; each subsequent attempt doubles the delay, up to
+# ``_OPENCHAMBER_MAX_BACKOFF``.  Once discovered, the backoff resets so a
+# future restart of OpenChamber triggers a fresh fast retry cycle.
+_OPENCHAMBER_INITIAL_BACKOFF = 1.0
+_OPENCHAMBER_MAX_BACKOFF = 60.0
+_OPENCHAMBER_BACKOFF_FACTOR = 2.0
+
+
 @dataclass(frozen=True)
 class PinnedSession:
     plugin_id: str
@@ -64,6 +75,14 @@ class BridgeService:
             "connected": False,
             "detail": "Waiting for Stream Deck",
         }
+        # Exponential backoff state for OpenChamber Desktop re-discovery.
+        # When OpenChamber is already connected, ``_openchamber_backoff`` is 0
+        # and no retry is attempted.  When it is missing, each failed attempt
+        # doubles the delay (capped at ``_OPENCHAMBER_MAX_BACKOFF``), and a
+        # successful discovery resets it to ``_OPENCHAMBER_INITIAL_BACKOFF``.
+        self._openchamber_backoff = 0.0
+        self._openchamber_last_attempt = 0.0
+        self._logger = logging.getLogger(__name__)
 
     @staticmethod
     def _build_plugins(
@@ -438,3 +457,68 @@ class BridgeService:
 
     def close(self) -> None:
         self._close_plugins(self.plugins)
+
+    def rediscover_openchamber(self, *, now: float = 0.0) -> bool:
+        """Attempt to re-discover OpenChamber Desktop with exponential backoff.
+
+        Called from the Deck refresh loop on every cycle.  When OpenChamber is
+        already connected, this is a no-op.  When it is missing, the first call
+        waits ``_OPENCHAMBER_INITIAL_BACKOFF`` seconds (measured against
+        ``now``, which the caller supplies from ``time.monotonic()``); each
+        subsequent failed call doubles the delay, capped at
+        ``_OPENCHAMBER_MAX_BACKOFF``.  A successful discovery resets the backoff
+        and live-updates the OpenCode plugin's endpoints so sessions return
+        immediately without a Bridge restart.
+
+        Returns ``True`` if OpenChamber is connected after this call (either
+        already was, or just re-discovered), ``False`` if still not found.
+        """
+
+        if self.openchamber is not None:
+            return True
+
+        # In test contexts ``now`` may be 0; fall back to monotonic time.
+        if now == 0.0:
+            import time as _time
+
+            now = _time.monotonic()
+
+        elapsed = now - self._openchamber_last_attempt
+        if elapsed < self._openchamber_backoff:
+            return False
+
+        self._openchamber_last_attempt = now
+        desktop = discover_openchamber_desktop()
+        if desktop is None:
+            # Back off: first failure starts at INITIAL_BACKOFF, subsequent
+            # failures double the delay up to MAX_BACKOFF.
+            if self._openchamber_backoff == 0.0:
+                self._openchamber_backoff = _OPENCHAMBER_INITIAL_BACKOFF
+            else:
+                self._openchamber_backoff = min(
+                    self._openchamber_backoff * _OPENCHAMBER_BACKOFF_FACTOR,
+                    _OPENCHAMBER_MAX_BACKOFF,
+                )
+            self._logger.info(
+                "OpenChamber Desktop not found; retrying in %.1fs",
+                self._openchamber_backoff,
+            )
+            return False
+
+        # Success — update state and live-patch the OpenCode plugin endpoints.
+        self._logger.info(
+            "OpenChamber Desktop %s discovered at %s", desktop.version, desktop.url
+        )
+        self.openchamber = desktop
+        self._openchamber_backoff = 0.0
+        self._openchamber_last_attempt = 0.0
+        plugin = self.plugins.get("opencode")
+        if isinstance(plugin, OpenCodePlugin):
+            configured = plugin.config.get("endpoints", [])
+            plugin.config["endpoints"] = list(
+                dict.fromkeys([desktop.opencode_proxy_url, *configured])
+            )
+            # Clear the cached endpoint so the next ``discover()`` / ``sessions()``
+            # call re-probes with the updated endpoint list.
+            plugin.endpoint = None
+        return True

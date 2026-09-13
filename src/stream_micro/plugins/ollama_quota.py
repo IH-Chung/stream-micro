@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import threading
+import time
+from collections.abc import Callable
 from typing import Any
 
 from ..config import OllamaConfig
+from ..models import QuotaSnapshot
 from ..scraper import ScrapeError, fetch_quota
 from .base import PluginHealth, PluginManifest, PluginSnapshot
 
 DEFAULT_SETTINGS_URL = "https://ollama.com/settings"
 DEFAULT_COOKIE_NAME = "__Secure-session"
 DEFAULT_REQUEST_TIMEOUT = 15.0
-DEFAULT_REFRESH_INTERVAL = 60.0
+DEFAULT_REFRESH_INTERVAL = 10.0
 
 _ALLOWED_KEYS = frozenset(
     {
@@ -24,6 +28,12 @@ _ALLOWED_KEYS = frozenset(
 )
 _IGNORED_LEGACY_KEYS = frozenset({"enabled", "legacy_config_path"})
 
+# How long a previously successful snapshot survives failed refreshes
+# before the plugin reports the scrape error instead of stale data.
+_STALE_GRACE_SECONDS = 300.0
+
+_Fetcher = Callable[[OllamaConfig], QuotaSnapshot]
+
 
 class OllamaQuotaPlugin:
     manifest = PluginManifest(
@@ -33,9 +43,20 @@ class OllamaQuotaPlugin:
         actions=(),
     )
 
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        config: dict[str, Any],
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        fetch_quota: _Fetcher = fetch_quota,
+    ) -> None:
         self.validate_config(config)
         self.config = config
+        self._clock = clock
+        self._fetch = fetch_quota
+        self._lock = threading.Lock()
+        self._cached: PluginSnapshot | None = None
+        self._cached_at: float | None = None
 
     def validate_config(self, config: dict[str, Any]) -> None:
         if not isinstance(config, dict):
@@ -71,16 +92,14 @@ class OllamaQuotaPlugin:
             ),
         )
 
-    def snapshot(self) -> PluginSnapshot:
-        if not self.config.get("cookie_value", "").strip():
-            return PluginSnapshot(
-                PluginHealth(False, "No cookie value configured"),
-                signals={},
-            )
-        try:
-            quota = fetch_quota(self._build_ollama_config())
-        except ScrapeError as exc:
-            return PluginSnapshot(PluginHealth(False, str(exc)), signals={})
+    def _refresh_interval(self) -> float:
+        interval = self.config.get("refresh_interval_seconds", DEFAULT_REFRESH_INTERVAL)
+        return float(interval) if isinstance(interval, (int, float)) else DEFAULT_REFRESH_INTERVAL
+
+    def _no_cookie_snapshot(self) -> PluginSnapshot:
+        return PluginSnapshot(PluginHealth(False, "No cookie value configured"), signals={})
+
+    def _snapshot_from_quota(self, quota: QuotaSnapshot) -> PluginSnapshot:
         return PluginSnapshot(
             PluginHealth(True, "Connected"),
             signals={
@@ -94,6 +113,60 @@ class OllamaQuotaPlugin:
                 else None,
             },
         )
+
+    def _error_snapshot(self, detail: str) -> PluginSnapshot:
+        return PluginSnapshot(PluginHealth(False, detail), signals={})
+
+    def snapshot(self) -> PluginSnapshot:
+        """Return the cached quota snapshot, refreshing at most once per interval.
+
+        Callers poll this from the Deck loop, the Dashboard, and /api/status;
+        each call returns instantly from cache instead of scraping ollama.com
+        synchronously.  A failed refresh keeps the last known data marked
+        ``Connected (stale)`` so a transient network hiccup never blanks the
+        Deck key.
+        """
+
+        if not self.config.get("cookie_value", "").strip():
+            return self._no_cookie_snapshot()
+        interval = self._refresh_interval()
+        now = self._clock()
+        with self._lock:
+            if (
+                self._cached is not None
+                and self._cached_at is not None
+                and now - self._cached_at < interval
+            ):
+                return self._cached
+        # Fetch outside the lock so a slow ollama.com response never blocks
+        # concurrent snapshot() callers; they may duplicate one in-flight
+        # fetch, which is harmless.  The fetch takes at most
+        # request_timeout_seconds (default 15 s), shorter than typical
+        # FastAPI request timeouts, so a hung upstream surfaces as a health
+        # error rather than a dead Bridge.
+        try:
+            quota = self._fetch(self._build_ollama_config())
+            snapshot = self._snapshot_from_quota(quota)
+        except ScrapeError as exc:
+            with self._lock:
+                if (
+                    self._cached is not None
+                    and self._cached.health.connected
+                    and self._cached_at is not None
+                    and now - self._cached_at < _STALE_GRACE_SECONDS + interval
+                ):
+                    stale = PluginSnapshot(
+                        PluginHealth(True, "Connected (stale)"),
+                        signals=dict(self._cached.signals or {}),
+                    )
+                    self._cached = stale
+                    self._cached_at = now
+                    return stale
+                snapshot = self._error_snapshot(str(exc))
+        with self._lock:
+            self._cached = snapshot
+            self._cached_at = now
+        return snapshot
 
     def invoke(self, action: str, params: dict[str, Any]) -> Any:
         raise ValueError("Ollama quota is display-only")

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import PureWindowsPath
@@ -23,6 +24,11 @@ class OpenCodeError(RuntimeError):
 
 
 LIVE_STATE_SESSION_LIMIT = 5
+
+# Messages and tool parts older than this are considered abandoned — the
+# session crashed, timed out, or was killed without OpenCode writing
+# ``time.completed`` or updating the tool ``state.status``.
+STALE_THRESHOLD_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -73,11 +79,13 @@ class OpenCodePlugin:
         *,
         client: httpx.Client | None = None,
         port_provider: Callable[[], Iterable[int]] = default_loopback_ports,
+        time_provider: Callable[[], float] = time.time,
     ) -> None:
         self.validate_config(config)
         self.config = config
         self._client = client or httpx.Client(timeout=3.0)
         self._port_provider = port_provider
+        self._time_provider = time_provider
         self.endpoint: OpenCodeEndpoint | None = None
         self._recently_busy: set[str] = set()
         self._completed: set[str] = set()
@@ -201,12 +209,20 @@ class OpenCodePlugin:
         waiting for user input, not actively working — those session ids go into
         the ``waiting`` set so the Deck key shows amber instead of blue.
 
+        **Staleness guard.**  When a session crashes, times out, or is killed
+        mid-turn, OpenCode never writes ``time.completed`` and any tool part
+        stays stuck at ``state.status='running'``.  Without a guard the Deck
+        key would show RUNNING forever.  We treat messages and tool parts
+        older than ``STALE_THRESHOLD_SECONDS`` as abandoned and do not count
+        them as active.
+
         One ``GET /session/:id/message?limit=1`` call per session is cheap
         (5 sessions × 5 s interval = 1 req/s) and authoritative.
         """
 
         active: set[str] = set()
         waiting: set[str] = set()
+        now = self._time_provider()
         for sid in session_ids:
             try:
                 response = self._client.get(
@@ -237,6 +253,20 @@ class OpenCodePlugin:
                     state = part.get("state")
                     status = state.get("status") if isinstance(state, dict) else None
                     if status in ("running", "pending"):
+                        # Staleness guard: if the tool started more than
+                        # STALE_THRESHOLD_SECONDS ago it was abandoned by a
+                        # crash or kill and should not count as active.
+                        part_time = state.get("time") if isinstance(state, dict) else None
+                        tool_start = (
+                            part_time.get("start")
+                            if isinstance(part_time, dict)
+                            else None
+                        )
+                        if (
+                            isinstance(tool_start, (int, float))
+                            and now - tool_start / 1000 > STALE_THRESHOLD_SECONDS
+                        ):
+                            continue
                         tool_name = str(part.get("tool", ""))
                         if tool_name in ("question", "permission"):
                             waiting.add(sid)
@@ -250,12 +280,27 @@ class OpenCodePlugin:
             # an explicit running/pending tool part.
             time_field = info.get("time")
             completed = time_field.get("completed") if isinstance(time_field, dict) else None
-            if completed is None:
-                active.add(sid)
+            if completed is not None:
+                # Message has a completed timestamp — the turn ended
+                # normally.  ``finish`` is ``None`` while the assistant
+                # is still streaming, ``""`` when the turn ended without
+                # tool-calls (e.g. a plain text reply or an abort), and a
+                # non-empty string like ``"tool-calls"`` when tools were
+                # called.  An empty-string ``finish`` with ``completed``
+                # set means the session is NOT running.
                 continue
-            if not info.get("finish"):
-                active.add(sid)
+            # ``completed`` is absent.  If the message was created more
+            # than STALE_THRESHOLD_SECONDS ago, the session crashed or
+            # was killed mid-turn — don't count it as active.
+            created = time_field.get("created") if isinstance(time_field, dict) else None
+            if (
+                isinstance(created, (int, float))
+                and now - created / 1000 > STALE_THRESHOLD_SECONDS
+            ):
                 continue
+            # Message is recent and has no completed timestamp — the
+            # assistant is actively generating.
+            active.add(sid)
         return active, waiting
 
     def sessions(self) -> tuple[AgentSession, ...]:

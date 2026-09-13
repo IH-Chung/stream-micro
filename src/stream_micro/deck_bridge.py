@@ -36,6 +36,11 @@ class Mk2BridgeRunner:
         configured = self.service.config.stream_deck.brightness
         self._logger.debug("refresh: pushing brightness=%d to device", configured)
         output.set_brightness(configured)
+        # Re-discover OpenChamber Desktop if it was not running when the Bridge
+        # started.  This uses exponential backoff internally so it is cheap
+        # when OpenChamber is already connected (a no-op) and throttled when
+        # it is still missing.
+        self.service.rediscover_openchamber(now=self._clock())
         snapshots = self.service.snapshots()
         self.sessions_by_plugin = {
             plugin_id: snapshot.sessions for plugin_id, snapshot in snapshots.items()

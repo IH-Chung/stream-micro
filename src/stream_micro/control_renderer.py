@@ -12,7 +12,7 @@ from .renderer import _font
 
 _STATUS_COLORS = {
     SessionState.IDLE: "#ffffff",
-    SessionState.RUNNING: "#66d9ff",
+    SessionState.RUNNING: "#4a9eff",
     SessionState.WAITING: "#ffc15a",
     SessionState.COMPLETED: "#5af08c",
     SessionState.ERROR: "#ff7983",
@@ -236,11 +236,14 @@ def render_quota_key(
         font=title_font,
     )
 
+    reset_font = _font(max(7, height // 12))
+    reset_color = "#b9c7da"
+
     if primary_pct is not None:
         pct = float(primary_pct)
         color = _quota_color(pct)
         draw.text(
-            (width // 2, height * 0.33),
+            (width // 2, height * 0.28),
             f"{pct:g}%",
             anchor="mm",
             align="center",
@@ -248,7 +251,7 @@ def render_quota_key(
             font=_font(max(16, height // 4), bold=True),
         )
         draw.text(
-            (width // 2, height * 0.46),
+            (width // 2, height * 0.42),
             str(primary_label).upper(),
             anchor="mm",
             align="center",
@@ -256,19 +259,30 @@ def render_quota_key(
             font=_font(max(7, height // 13), bold=True),
         )
         bar_left, bar_right = 5, width - 5
-        bar_top, bar_bottom = int(height * 0.50), int(height * 0.56)
+        bar_top, bar_bottom = int(height * 0.46), int(height * 0.52)
         draw.rounded_rectangle((bar_left, bar_top, bar_right, bar_bottom), radius=2, fill="#263044")
         fill_right = bar_left + round((bar_right - bar_left) * pct / 100)
         if fill_right > bar_left:
             draw.rounded_rectangle(
                 (bar_left, bar_top, fill_right, bar_bottom), radius=2, fill=color
             )
+        # Primary reset time right below the bar.
+        draw.text(
+            (width // 2, height * 0.57),
+            _format_reset(primary_reset if isinstance(primary_reset, str) else None),
+            anchor="mm",
+            align="center",
+            fill=reset_color,
+            font=reset_font,
+        )
+
+    secondary_reset = signals.get("secondary_reset_at", signals.get("weekly_reset_at"))
 
     if secondary_pct is not None:
         pct = float(secondary_pct)
         color = _quota_color(pct)
         draw.text(
-            (width // 2, height * 0.64),
+            (width // 2, height * 0.68),
             f"{str(secondary_label).upper()} {pct:g}%",
             anchor="mm",
             align="center",
@@ -276,24 +290,32 @@ def render_quota_key(
             font=_font(max(9, height // 9), bold=True),
         )
         bar_left, bar_right = 5, width - 5
-        bar_top, bar_bottom = int(height * 0.74), int(height * 0.80)
+        bar_top, bar_bottom = int(height * 0.76), int(height * 0.82)
         draw.rounded_rectangle((bar_left, bar_top, bar_right, bar_bottom), radius=2, fill="#263044")
         fill_right = bar_left + round((bar_right - bar_left) * pct / 100)
         if fill_right > bar_left:
             draw.rounded_rectangle(
                 (bar_left, bar_top, fill_right, bar_bottom), radius=2, fill=color
             )
-
-    reset_raw = primary_reset
-    reset_text = _format_reset(reset_raw if isinstance(reset_raw, str) else None)
-    draw.text(
-        (width // 2, height * 0.90),
-        reset_text,
-        anchor="mm",
-        align="center",
-        fill="#70819b",
-        font=_font(max(6, height // 14)),
-    )
+        # Secondary reset time right below the bar.
+        draw.text(
+            (width // 2, height * 0.89),
+            _format_reset(secondary_reset if isinstance(secondary_reset, str) else None),
+            anchor="mm",
+            align="center",
+            fill=reset_color,
+            font=reset_font,
+        )
+    elif primary_pct is not None:
+        # No secondary window — keep a single reset at the bottom.
+        draw.text(
+            (width // 2, height * 0.85),
+            _format_reset(primary_reset if isinstance(primary_reset, str) else None),
+            anchor="mm",
+            align="center",
+            fill=reset_color,
+            font=reset_font,
+        )
     return image
 
 

@@ -4,7 +4,12 @@ import httpx
 import pytest
 
 from stream_micro.plugins.base import SessionState
-from stream_micro.plugins.opencode import OpenCodeError, OpenCodePlugin, listening_loopback_ports
+from stream_micro.plugins.opencode import (
+    STALE_THRESHOLD_SECONDS,
+    OpenCodeError,
+    OpenCodePlugin,
+    listening_loopback_ports,
+)
 
 
 def handler(request: httpx.Request) -> httpx.Response:
@@ -595,3 +600,225 @@ def test_netstat_parser_only_returns_loopback_listening_ports() -> None:
     )
 
     assert listening_loopback_ports(output) == {4096, 9000}
+
+
+def test_stale_message_without_completed_shows_idle() -> None:
+    """When a session crashed or was killed mid-turn, the last assistant
+    message has no ``time.completed`` but is old.  The session should NOT
+    be shown as RUNNING — it should be IDLE (or COMPLETED via the
+    ``_recently_busy`` transition)."""
+
+    def stale_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/global/health":
+            return httpx.Response(200, json={"healthy": True, "version": "1.0"})
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "crashed",
+                        "title": "Crashed session",
+                        "projectID": "project-a",
+                        "directory": "C:\\work\\project-a",
+                        "time": {"created": 1, "updated": 1},
+                    },
+                ],
+            )
+        if request.url.path == "/session/status":
+            return httpx.Response(200, json={})
+        if request.url.path == "/session/crashed/message":
+            # created is 5 minutes ago (300_000 ms), no completed
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "info": {
+                            "id": "msg_old",
+                            "role": "assistant",
+                            "time": {"created": 300_000},
+                            "finish": "",
+                        },
+                        "parts": [],
+                    }
+                ],
+            )
+        if request.url.path in ("/permission", "/question"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    client = OpenCodePlugin(
+        {"enabled": True, "endpoints": ["http://127.0.0.1:4096"], "password_env": None},
+        client=httpx.Client(transport=httpx.MockTransport(stale_handler)),
+        port_provider=lambda: {4096},
+        time_provider=lambda: 300_000 + 10,  # now is 10 seconds after created
+    )
+    snapshot = client.snapshot()
+    assert snapshot.sessions[0].state is not SessionState.RUNNING
+
+
+def test_stale_tool_part_shows_idle() -> None:
+    """When a tool part is stuck at state.status='running' but the tool
+    started long ago, the session was killed mid-tool and should NOT be
+    shown as RUNNING."""
+
+    def stale_tool_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/global/health":
+            return httpx.Response(200, json={"healthy": True, "version": "1.0"})
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "stuck",
+                        "title": "Stuck tool",
+                        "projectID": "project-a",
+                        "directory": "C:\\work\\project-a",
+                        "time": {"created": 1, "updated": 1},
+                    },
+                ],
+            )
+        if request.url.path == "/session/status":
+            return httpx.Response(200, json={})
+        if request.url.path == "/session/stuck/message":
+            # Tool started 5 minutes ago, still "running"
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "info": {
+                            "id": "msg_old",
+                            "role": "assistant",
+                            "time": {"created": 300_000},
+                            "finish": "",
+                        },
+                        "parts": [
+                            {
+                                "type": "tool",
+                                "tool": "bash",
+                                "state": {
+                                    "status": "running",
+                                    "time": {"start": 300_000},
+                                },
+                            },
+                        ],
+                    }
+                ],
+            )
+        if request.url.path in ("/permission", "/question"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    client = OpenCodePlugin(
+        {"enabled": True, "endpoints": ["http://127.0.0.1:4096"], "password_env": None},
+        client=httpx.Client(transport=httpx.MockTransport(stale_tool_handler)),
+        port_provider=lambda: {4096},
+        time_provider=lambda: 300_000 + 10 + STALE_THRESHOLD_SECONDS * 1000,
+    )
+    snapshot = client.snapshot()
+    assert snapshot.sessions[0].state is not SessionState.RUNNING
+
+
+def test_finish_empty_string_with_completed_is_not_running() -> None:
+    """When a message has finish='' (empty string) AND time.completed set,
+    the turn ended normally without tool-calls.  The session should NOT
+    be shown as RUNNING."""
+
+    def finish_empty_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/global/health":
+            return httpx.Response(200, json={"healthy": True, "version": "1.0"})
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "done",
+                        "title": "Finished normally",
+                        "projectID": "project-a",
+                        "directory": "C:\\work\\project-a",
+                        "time": {"created": 1, "updated": 1},
+                    },
+                ],
+            )
+        if request.url.path == "/session/status":
+            return httpx.Response(200, json={})
+        if request.url.path == "/session/done/message":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "info": {
+                            "id": "msg_done",
+                            "role": "assistant",
+                            "time": {"created": 1000, "completed": 2000},
+                            "finish": "",
+                        },
+                        "parts": [],
+                    }
+                ],
+            )
+        if request.url.path in ("/permission", "/question"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    client = OpenCodePlugin(
+        {"enabled": True, "endpoints": ["http://127.0.0.1:4096"], "password_env": None},
+        client=httpx.Client(transport=httpx.MockTransport(finish_empty_handler)),
+        port_provider=lambda: {4096},
+    )
+    snapshot = client.snapshot()
+    assert snapshot.sessions[0].state is not SessionState.RUNNING
+
+
+def test_recent_message_without_completed_is_running() -> None:
+    """A message created very recently with no completed timestamp should
+    still be detected as RUNNING — the staleness guard must not break the
+    positive case."""
+
+    def recent_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/global/health":
+            return httpx.Response(200, json={"healthy": True, "version": "1.0"})
+        if request.url.path == "/experimental/session":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "live",
+                        "title": "Actively generating",
+                        "projectID": "project-a",
+                        "directory": "C:\\work\\project-a",
+                        "time": {"created": 1, "updated": 1},
+                    },
+                ],
+            )
+        if request.url.path == "/session/status":
+            return httpx.Response(200, json={})
+        if request.url.path == "/session/live/message":
+            # created 2 seconds ago — well within the staleness threshold
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "info": {
+                            "id": "msg_live",
+                            "role": "assistant",
+                            "time": {"created": 1700000000000},
+                            "finish": None,
+                        },
+                        "parts": [],
+                    }
+                ],
+            )
+        if request.url.path in ("/permission", "/question"):
+            return httpx.Response(200, json=[])
+        return httpx.Response(404)
+
+    # now is 2 seconds after created (in seconds; created is in ms)
+    now = 1700000000000 / 1000 + 2
+    client = OpenCodePlugin(
+        {"enabled": True, "endpoints": ["http://127.0.0.1:4096"], "password_env": None},
+        client=httpx.Client(transport=httpx.MockTransport(recent_handler)),
+        port_provider=lambda: {4096},
+        time_provider=lambda: now,
+    )
+    snapshot = client.snapshot()
+    assert snapshot.sessions[0].state is SessionState.RUNNING

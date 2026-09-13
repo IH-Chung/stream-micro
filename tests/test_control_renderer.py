@@ -42,7 +42,7 @@ def test_session_key_renders_name_project_folder_and_state() -> None:
         for y in range(image.height)
     )  # Legacy unbound green frame.
     # State is a full-width, bright badge so it stays readable on the physical Deck.
-    assert image.getpixel((8, 72)) == (102, 217, 255)
+    assert image.getpixel((8, 72)) == (74, 158, 255)
 
 
 def test_session_title_wraps_to_two_lines_before_truncating() -> None:
@@ -118,10 +118,12 @@ def test_quota_key_renders_generic_primary_and_secondary_windows() -> None:
                 "primary_reset_at": "2024-11-07T00:00:00+00:00",
                 "secondary_percent": 80.0,
                 "secondary_label": "WEEK",
+                "secondary_reset_at": "2024-11-14T00:00:00+00:00",
             },
         ),
         size=(96, 96),
     )
 
-    assert image.getpixel((6, 50)) == (34, 197, 94)
-    assert image.getpixel((6, 72)) == (245, 158, 11)
+    # Primary bar spans y≈44..49, secondary bar y≈73..78 on a 96px key.
+    assert image.getpixel((6, 47)) == (34, 197, 94)
+    assert image.getpixel((6, 76)) == (245, 158, 11)
