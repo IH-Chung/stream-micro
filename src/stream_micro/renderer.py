@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import os
 from datetime import datetime
 from functools import lru_cache
@@ -48,9 +49,15 @@ def _font(size: int, *, bold: bool = False) -> ImageFont.ImageFont | ImageFont.F
     ]
     for candidate in cjk_candidates:
         try:
-            return ImageFont.truetype(str(candidate), size)
+            font = ImageFont.truetype(str(candidate), size)
         except OSError:
             continue
+        if candidate.name.endswith("-VF.ttf"):
+            # Variable Noto fonts default to their Thin (100) instance, which
+            # made even "bold" labels hard to read on the Deck.
+            with contextlib.suppress(OSError, ValueError):
+                font.set_variation_by_axes([800 if bold else 500])
+        return font
 
     fallback_names = (
         ("arialbd.ttf", "DejaVuSans-Bold.ttf")

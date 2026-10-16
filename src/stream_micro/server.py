@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -164,6 +165,10 @@ def create_app(config_path: Path | str, *, service: BridgeService | None = None)
 
     dashboard_dir = Path(__file__).resolve().parents[2] / "frontend" / "dist"
     if (dashboard_dir / "index.html").is_file():
+        # Windows registry entries can map .js to text/plain, which browsers reject
+        # for module scripts.
+        mimetypes.add_type("text/javascript", ".js")
+        mimetypes.add_type("text/css", ".css")
         app.mount("/", StaticFiles(directory=dashboard_dir, html=True), name="dashboard")
 
     return app
