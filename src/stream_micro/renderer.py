@@ -126,6 +126,10 @@ def render_quota_key(
     return image
 
 
+def render_blank_key(config: DisplayConfig, size: tuple[int, int]) -> Image.Image:
+    return Image.new("RGB", size, config.background_color)
+
+
 def render_error_key(message: str, config: DisplayConfig, size: tuple[int, int]) -> Image.Image:
     image = Image.new("RGB", size, config.background_color)
     draw = ImageDraw.Draw(image)
