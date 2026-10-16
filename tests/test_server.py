@@ -356,3 +356,21 @@ def test_concurrent_saves_run_one_at_a_time(tmp_path: Path, monkeypatch) -> None
 
     assert peak[0] == 1
     assert not cast(_FakeProvider, service.plugins["codex"]).closed
+
+
+def test_only_the_bridge_page_may_save_settings(tmp_path: Path) -> None:
+    config_path = tmp_path / "control.yaml"
+    write_control_config(config_path, default_control_config())
+    app = create_app(config_path)
+    with TestClient(app, base_url="http://127.0.0.1:8766") as client:
+        data = client.get("/api/config").json()
+        own = {"Origin": "http://127.0.0.1:8766"}
+        assert client.put("/api/config", json=data, headers=own).status_code == 200
+        assert client.put("/api/config", json=data).status_code == 200  # a script
+        other = {"Origin": "http://evil.example"}
+        assert client.put("/api/config", json=data, headers=other).status_code == 403
+    rebound = TestClient(create_app(config_path), base_url="http://evil.example:8766")
+    with rebound as client:
+        headers = {"Origin": "http://evil.example:8766"}  # its own Host, but not loopback
+        assert client.put("/api/config", json=data, headers=headers).status_code == 403
+
